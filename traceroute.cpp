@@ -1,12 +1,11 @@
 #include <arpa/inet.h>
-#include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
-#include <signal.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 #include <iostream>
+#include <utility>
 
 in_addr_t LookUp(const char *domain) {
   hostent *host = gethostbyname(domain);
