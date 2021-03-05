@@ -22,7 +22,7 @@ jobs:
 
     # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
-      - name: clang-format lint
-        uses: DoozyX/clang-format-lint-action@v0.11
+      - name: Run clang-format
+        uses: HorstBaerbel/action-clang-format@1.4
       - name: Run clang-tidy
         uses: HorstBaerbel/action-clang-tidy@1.1
