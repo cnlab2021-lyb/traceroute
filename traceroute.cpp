@@ -10,8 +10,11 @@
 #include <cstring>
 #include <functional>
 #include <iostream>
+#include <memory>
 #include <utility>
 #include <vector>
+
+namespace {
 
 constexpr int kIpHeaderSize = 20;
 constexpr int kIcmpIdentifier = 0x7122, kIcmpSeqNum = 0x1234;
@@ -24,6 +27,7 @@ in_addr_t LookUp(const char *domain) {
   }
   auto **addr_list = reinterpret_cast<in_addr **>(host->h_addr_list);
   int num_ip = 0;
+  // cppcheck-suppress nullPointerRedundantCheck
   while (addr_list[num_ip]) num_ip++;
   if (!addr_list || !addr_list[0]) {
     std::cerr << "traceroute: unknown host " << domain << "\n";
@@ -51,6 +55,7 @@ Config ParseArg(int argc, char *argv[]) {
   bool tcp = false, udp = false;
   Config config{};
 
+  // NOLINTNEXTLINE
   auto ParseInt = [&]() {
     if (optind == argc) PrintUsage();
     try {
@@ -92,13 +97,13 @@ struct alignas(2) ICMPPacket {
 
   ICMPPacket() = default;
 
-  ICMPPacket(uint16_t identifier, uint16_t sequence_number)
+  ICMPPacket(uint16_t id, uint16_t seq)
       : type(kEchoRequest),
         code(0x0),
-        identifier(htons(identifier)),
-        sequence_number(htons(sequence_number)) {
-    uint32_t sum = (static_cast<uint32_t>(type) << 8) + code + identifier +
-                   sequence_number;
+        identifier(htons(id)),
+        sequence_number(htons(seq)) {
+    uint32_t sum = (static_cast<uint32_t>(type) << 8) + code + id +
+                   seq;
     auto high = static_cast<uint32_t>(sum >> 16);
     auto low = static_cast<uint32_t>(sum & ((1U << 16) - 1));
     checksum = htons(static_cast<uint16_t>(~(high + low)));
@@ -112,11 +117,17 @@ struct alignas(2) ICMPPacket {
 
 class TraceRouteClient {
  protected:
-  struct sockaddr_in addr_;
-  int fd_;
+  struct sockaddr_in addr_{};  // NOLINT
+  int fd_{};  // NOLINT
 
  public:
   TraceRouteClient() = default;
+
+  // XXX(wp): Probably implement these later?
+  TraceRouteClient(const TraceRouteClient &other) = delete;
+  TraceRouteClient(TraceRouteClient &&other) = delete;
+  TraceRouteClient& operator=(const TraceRouteClient &other) = delete;
+  TraceRouteClient& operator=(TraceRouteClient &&other) = delete;
 
   TraceRouteClient(char *host, int domain, int type, int protocol)
       : fd_(socket(domain, type, protocol)) {
@@ -126,15 +137,16 @@ class TraceRouteClient {
     addr_.sin_addr.s_addr = LookUp(host);
   }
 
-  ~TraceRouteClient() = default;
+  virtual ~TraceRouteClient() = default;
 
   virtual void InitSocket(int ttl) = 0;
   virtual void SendRequest(ICMPPacket packet) = 0;
 
+  [[nodiscard]]
   std::pair<std::chrono::time_point<std::chrono::steady_clock>, bool>
-  RecvReply() {
+  RecvReply() const {
     while (true) {
-      std::array<char, kIpHeaderSize + ICMPPacket::kPacketSize> buffer{};
+      std::array<char, kIpHeaderSize + ICMPPacket::kPacketSize + 64> buffer{};
       ICMPPacket recv{};
       struct sockaddr_in recv_addr {};
       socklen_t recv_addr_len = sizeof(recv_addr);
@@ -143,8 +155,7 @@ class TraceRouteClient {
           reinterpret_cast<struct sockaddr *>(&recv_addr), &recv_addr_len);
       auto recv_time = std::chrono::steady_clock::now();
       if (recv_bytes == -1) {
-        perror("recvfrom");
-        exit(1);
+        PrintError("recvfrom");
       }
       // Extract ICMP content
       memcpy(&recv, buffer.data() + kIpHeaderSize, sizeof(recv));
@@ -157,7 +168,17 @@ class TraceRouteClient {
           std::cerr << "GET!\n";
           return {recv_time, false};
         }
-        if (recv.type == ICMPPacket::kTimeExceed) {
+      }
+      if (recv.type == ICMPPacket::kTimeExceed) {
+        ICMPPacket orig{};
+        memcpy(&orig,
+               buffer.data() + kIpHeaderSize + ICMPPacket::kPacketSize +
+                   kIpHeaderSize,
+               sizeof(orig));
+        orig.identifier = ntohs(orig.identifier);
+        orig.sequence_number = ntohs(orig.sequence_number);
+        if (orig.identifier == kIcmpIdentifier &&
+            orig.sequence_number == kIcmpSeqNum) {
           std::cerr << "Exceed!\n";
           return {recv_time, true};
         }
@@ -168,10 +189,16 @@ class TraceRouteClient {
 
 class ICMPClient : public TraceRouteClient {
  public:
-  ICMPClient(char *host)
+  explicit ICMPClient(char *host)
       : TraceRouteClient(host, AF_INET, SOCK_RAW, IPPROTO_ICMP) {}
 
-  ~ICMPClient() { close(fd_); }
+  // XXX(wp): Probably implement these later?
+  ICMPClient(const ICMPClient &other) = delete;
+  ICMPClient(ICMPClient &&other) = delete;
+  ICMPClient& operator=(const ICMPClient &other) = delete;
+  ICMPClient& operator=(ICMPClient &&other) = delete;
+
+  ~ICMPClient() override { close(fd_); }
 
   void InitSocket(int ttl) override {
     if (setsockopt(fd_, IPPROTO_IP, IP_TTL,
@@ -187,6 +214,8 @@ class ICMPClient : public TraceRouteClient {
   }
 };
 
+}  // namespace
+
 int main(int argc, char *argv[]) {
   static_assert(sizeof(ICMPPacket) == ICMPPacket::kPacketSize,
                 "Padding is not allowed.");
@@ -196,7 +225,8 @@ int main(int argc, char *argv[]) {
   // std::cout << "traceroute to " << config.hostname << " ("
   //           << inet_ntoa(addr.sin_addr) << "), " << kMaxHop << " hops max\n";
 
-  TraceRouteClient *client = new ICMPClient(config.hostname);
+  std::unique_ptr<TraceRouteClient> client =
+      std::make_unique<ICMPClient>(config.hostname);
   for (int hop = config.first_ttl; hop <= kMaxHop; ++hop) {
     std::vector<std::chrono::time_point<std::chrono::steady_clock>> send_time(
         config.nqueries);
