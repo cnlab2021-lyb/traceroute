@@ -51,8 +51,6 @@ struct ICMPPacket {
   static constexpr uint8_t kEchoReply = 0x0;
   static constexpr uint8_t kEchoRequest = 0x8;
 
-  static constexpr int kProtocol = 1;
-
   // type + code + checksum + identifier + seq
   static constexpr size_t kPacketSize = 8;
 
@@ -79,22 +77,30 @@ int main(int argc, char *argv[]) {
   auto [mode, host] = ParseArg(argc, argv);
 
   struct sockaddr_in addr;
-  addr.sin_port = htons(7122);
+  addr.sin_port = htons(7);
   addr.sin_family = AF_INET;
   addr.sin_addr.s_addr = LookUp(host);
 
-  constexpr int kMaxHop = 1;
+  constexpr int kMaxHop = 64;
   std::cout << "traceroute to " << host << " (" << inet_ntoa(addr.sin_addr)
             << "), " << kMaxHop << " hops max\n";
 
-  for (int hop = 0; hop < kMaxHop; ++hop) {
+  for (int hop = 1; hop <= kMaxHop; ++hop) {
     // TODO: properly set up identifer and sequence number
     ICMPPacket packet(0x7122, 0x1234);
-    int fd = socket(AF_INET, SOCK_RAW, ICMPPacket::kProtocol);
+    int fd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
     if (fd == -1) {
       perror("socket");
       exit(1);
     }
+
+    // Set TTL
+    if (setsockopt(fd, IPPROTO_IP, IP_TTL, reinterpret_cast<const void *>(&hop),
+                   sizeof(hop)) == -1) {
+      perror("setsockopt");
+      exit(1);
+    }
+
     ssize_t sz =
         sendto(fd, reinterpret_cast<const void *>(&packet), sizeof(packet), 0,
                reinterpret_cast<const struct sockaddr *>(&addr), sizeof(addr));
