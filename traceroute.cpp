@@ -5,12 +5,16 @@
 #include <unistd.h>
 
 #include <array>
+#include <cassert>
 #include <chrono>
+#include <cstring>
+#include <functional>
 #include <iostream>
 #include <utility>
 #include <vector>
 
-constexpr int kBufSize = 16;
+constexpr int kIpHeaderSize = 20;
+constexpr int kIcmpIdentifier = 0x7122, kIcmpSeqNum = 0x1234;
 
 in_addr_t LookUp(const char *domain) {
   hostent *host = gethostbyname(domain);
@@ -18,7 +22,7 @@ in_addr_t LookUp(const char *domain) {
     std::cerr << "traceroute: unknown host " << domain << "\n";
     exit(1);
   }
-  in_addr **addr_list = reinterpret_cast<in_addr **>(host->h_addr_list);
+  auto **addr_list = reinterpret_cast<in_addr **>(host->h_addr_list);
   int num_ip = 0;
   while (addr_list[num_ip]) num_ip++;
   if (!addr_list || !addr_list[0]) {
@@ -50,7 +54,7 @@ Config ParseArg(int argc, char *argv[]) {
   auto ParseInt = [&]() {
     if (optind == argc) PrintUsage();
     try {
-      return std::atoi(argv[optind++]);
+      return std::stoi(argv[optind++]);
     } catch (...) {
       PrintUsage();
     }
@@ -75,6 +79,7 @@ Config ParseArg(int argc, char *argv[]) {
 struct alignas(2) ICMPPacket {
   static constexpr uint8_t kEchoReply = 0x0;
   static constexpr uint8_t kEchoRequest = 0x8;
+  static constexpr uint8_t kTimeExceed = 11;
 
   // type + code + checksum + identifier + seq
   static constexpr size_t kPacketSize = 8;
@@ -94,8 +99,8 @@ struct alignas(2) ICMPPacket {
         sequence_number(htons(sequence_number)) {
     uint32_t sum = (static_cast<uint32_t>(type) << 8) + code + identifier +
                    sequence_number;
-    uint16_t high = static_cast<uint16_t>(sum >> 16);
-    uint16_t low = static_cast<uint16_t>(sum & ((1U << 16) - 1));
+    auto high = static_cast<uint16_t>(sum >> 16);
+    auto low = static_cast<uint16_t>(sum & ((1U << 16) - 1));
     checksum = htons(~(high + low));
   }
 };
@@ -126,20 +131,36 @@ class TraceRouteClient {
   virtual void InitSocket(int ttl) = 0;
   virtual void SendRequest(ICMPPacket packet) = 0;
 
-  void RecvReply() {
+  std::pair<std::chrono::time_point<std::chrono::steady_clock>, bool>
+  RecvReply() {
     while (true) {
-      std::array<char, kBufSize> buffer{};
+      std::array<char, kIpHeaderSize + ICMPPacket::kPacketSize> buffer{};
+      ICMPPacket recv{};
       struct sockaddr_in recv_addr {};
       socklen_t recv_addr_len = sizeof(recv_addr);
       auto recv_bytes = recvfrom(
-          fd_, reinterpret_cast<void *>(buffer.data()), kBufSize, 0,
+          fd_, reinterpret_cast<void *>(buffer.data()), buffer.size(), 0,
           reinterpret_cast<struct sockaddr *>(&recv_addr), &recv_addr_len);
-      if (recv_addr.sin_addr.s_addr == addr_.sin_addr.s_addr) {
-        // TODO: Verify that identifier / sequence numbers are good
-        // TODO: Measure time
-        // TODO: Check TTL
-        std::cerr << "GET!\n";
-        break;
+      auto recv_time = std::chrono::steady_clock::now();
+      if (recv_bytes == -1) {
+        perror("recvfrom");
+        exit(1);
+      }
+      // Extract ICMP content
+      memcpy(&recv, buffer.data() + kIpHeaderSize, sizeof(recv));
+      recv.identifier = ntohs(recv.identifier);
+      recv.sequence_number = ntohs(recv.sequence_number);
+      // TODO(wp): Measure time
+      if (recv.identifier == kIcmpIdentifier &&
+          recv.sequence_number == kIcmpSeqNum) {
+        if (recv.type == ICMPPacket::kEchoReply) {
+          std::cerr << "GET!\n";
+          return {recv_time, false};
+        }
+        if (recv.type == ICMPPacket::kTimeExceed) {
+          std::cerr << "Exceed!\n";
+          return {recv_time, true};
+        }
       }
     }
   }
@@ -167,7 +188,8 @@ class ICMPClient : public TraceRouteClient {
 };
 
 int main(int argc, char *argv[]) {
-  static_assert(sizeof(ICMPPacket) == 8, "Padding is not allowed.");
+  static_assert(sizeof(ICMPPacket) == ICMPPacket::kPacketSize,
+                "Padding is not allowed.");
   auto config = ParseArg(argc, argv);
 
   constexpr int kMaxHop = 64;
@@ -176,16 +198,22 @@ int main(int argc, char *argv[]) {
 
   TraceRouteClient *client = new ICMPClient(config.hostname);
   for (int hop = config.first_ttl; hop <= kMaxHop; ++hop) {
-    std::vector<std::chrono::time_point<std::chrono::system_clock>> send_time(
+    std::vector<std::chrono::time_point<std::chrono::steady_clock>> send_time(
         config.nqueries);
+    std::vector<std::chrono::time_point<std::chrono::steady_clock>> recv_time(
+        config.nqueries);
+    bool is_exceed = true;
     for (int query = 0; query < config.nqueries; ++query) {
-      // TODO: properly set up identifer and sequence number
-      ICMPPacket request(0x7122, 0x1234);
+      // TODO(waynetu): properly set up identifer and sequence number
+      ICMPPacket request(kIcmpIdentifier, kIcmpSeqNum);
       client->InitSocket(hop);
-      send_time[query] = std::chrono::system_clock::now();
+      send_time[query] = std::chrono::steady_clock::now();
       client->SendRequest(request);
-      client->RecvReply();
+      bool ex{};
+      std::tie(recv_time[query], ex) = client->RecvReply();
+      is_exceed &= ex;
     }
+
+    if (!is_exceed) break;
   }
-  return 0;
 }
