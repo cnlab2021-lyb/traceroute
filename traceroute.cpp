@@ -10,6 +10,8 @@
 #include <utility>
 #include <vector>
 
+constexpr int kBufSize = 16;
+
 in_addr_t LookUp(const char *domain) {
   hostent *host = gethostbyname(domain);
   if (!host || !host->h_addr_list) {
@@ -138,6 +140,22 @@ int main(int argc, char *argv[]) {
                  sizeof(addr)) == -1) {
         perror("sendto");
         exit(1);
+      }
+
+      while (true) {
+        std::array<char, kBufSize> buffer{};
+        struct sockaddr_in recv_addr {};
+        socklen_t recv_addr_len = sizeof(recv_addr);
+        auto recv_bytes = recvfrom(
+            fd, reinterpret_cast<void *>(buffer.data()), kBufSize, 0,
+            reinterpret_cast<struct sockaddr *>(&recv_addr), &recv_addr_len);
+        if (recv_addr.sin_addr.s_addr == addr.sin_addr.s_addr) {
+          // TODO: Verify that identifier / sequence numbers are good
+          // TODO: Measure time
+          // TODO: Check TTL
+          std::cerr << "GET!\n";
+          break;
+        }
       }
     }
   }
