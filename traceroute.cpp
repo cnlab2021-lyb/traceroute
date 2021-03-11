@@ -72,7 +72,7 @@ Config ParseArg(int argc, char *argv[]) {
   return config;
 }
 
-struct ICMPPacket {
+struct alignas(2) ICMPPacket {
   static constexpr uint8_t kEchoReply = 0x0;
   static constexpr uint8_t kEchoRequest = 0x8;
 
@@ -100,63 +100,91 @@ struct ICMPPacket {
   }
 };
 
+[[noreturn]] void PrintError(const char *s = nullptr) {
+  perror(s);
+  exit(1);
+}
+
+class TraceRouteClient {
+ protected:
+  struct sockaddr_in addr_;
+  int fd_;
+
+ public:
+  TraceRouteClient() = default;
+
+  TraceRouteClient(char *host, int domain, int type, int protocol)
+      : fd_(socket(domain, type, protocol)) {
+    if (fd_ == -1) PrintError("socket");
+    addr_.sin_port = htons(7);
+    addr_.sin_family = AF_INET;
+    addr_.sin_addr.s_addr = LookUp(host);
+  }
+
+  ~TraceRouteClient() = default;
+
+  virtual void InitSocket(int ttl) = 0;
+  virtual void SendRequest(ICMPPacket packet) = 0;
+
+  void RecvReply() {
+    while (true) {
+      std::array<char, kBufSize> buffer{};
+      struct sockaddr_in recv_addr {};
+      socklen_t recv_addr_len = sizeof(recv_addr);
+      auto recv_bytes = recvfrom(
+          fd_, reinterpret_cast<void *>(buffer.data()), kBufSize, 0,
+          reinterpret_cast<struct sockaddr *>(&recv_addr), &recv_addr_len);
+      if (recv_addr.sin_addr.s_addr == addr_.sin_addr.s_addr) {
+        // TODO: Verify that identifier / sequence numbers are good
+        // TODO: Measure time
+        // TODO: Check TTL
+        std::cerr << "GET!\n";
+        break;
+      }
+    }
+  }
+};
+
+class ICMPClient : public TraceRouteClient {
+ public:
+  ICMPClient(char *host)
+      : TraceRouteClient(host, AF_INET, SOCK_RAW, IPPROTO_ICMP) {}
+
+  ~ICMPClient() { close(fd_); }
+
+  void InitSocket(int ttl) override {
+    if (setsockopt(fd_, IPPROTO_IP, IP_TTL,
+                   reinterpret_cast<const void *>(&ttl), sizeof(ttl)) < 0)
+      PrintError("setsockopt");
+  }
+
+  void SendRequest(ICMPPacket packet) override {
+    if (sendto(fd_, reinterpret_cast<const void *>(&packet), sizeof(packet), 0,
+               reinterpret_cast<const struct sockaddr *>(&addr_),
+               sizeof(addr_)) < 0)
+      PrintError("sendto");
+  }
+};
+
 int main(int argc, char *argv[]) {
-  static_assert(sizeof(ICMPPacket) == 8 && "Padding is not allowed.");
+  static_assert(sizeof(ICMPPacket) == 8, "Padding is not allowed.");
   auto config = ParseArg(argc, argv);
 
-  struct sockaddr_in addr;
-  addr.sin_port = htons(7);
-  addr.sin_family = AF_INET;
-  addr.sin_addr.s_addr = LookUp(config.hostname);
-
   constexpr int kMaxHop = 64;
-  std::cout << "traceroute to " << config.hostname << " ("
-            << inet_ntoa(addr.sin_addr) << "), " << kMaxHop << " hops max\n";
+  // std::cout << "traceroute to " << config.hostname << " ("
+  //           << inet_ntoa(addr.sin_addr) << "), " << kMaxHop << " hops max\n";
 
+  TraceRouteClient *client = new ICMPClient(config.hostname);
   for (int hop = config.first_ttl; hop <= kMaxHop; ++hop) {
     std::vector<std::chrono::time_point<std::chrono::system_clock>> send_time(
         config.nqueries);
     for (int query = 0; query < config.nqueries; ++query) {
       // TODO: properly set up identifer and sequence number
       ICMPPacket request(0x7122, 0x1234);
-
-      int fd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
-      if (fd == -1) {
-        perror("socket");
-        exit(1);
-      }
-
-      // Set TTL
-      if (setsockopt(fd, IPPROTO_IP, IP_TTL,
-                     reinterpret_cast<const void *>(&hop), sizeof(hop)) == -1) {
-        perror("setsockopt");
-        exit(1);
-      }
-
-      // Send ICMP packet
+      client->InitSocket(hop);
       send_time[query] = std::chrono::system_clock::now();
-      if (sendto(fd, reinterpret_cast<const void *>(&request), sizeof(request),
-                 0, reinterpret_cast<const struct sockaddr *>(&addr),
-                 sizeof(addr)) == -1) {
-        perror("sendto");
-        exit(1);
-      }
-
-      while (true) {
-        std::array<char, kBufSize> buffer{};
-        struct sockaddr_in recv_addr {};
-        socklen_t recv_addr_len = sizeof(recv_addr);
-        auto recv_bytes = recvfrom(
-            fd, reinterpret_cast<void *>(buffer.data()), kBufSize, 0,
-            reinterpret_cast<struct sockaddr *>(&recv_addr), &recv_addr_len);
-        if (recv_addr.sin_addr.s_addr == addr.sin_addr.s_addr) {
-          // TODO: Verify that identifier / sequence numbers are good
-          // TODO: Measure time
-          // TODO: Check TTL
-          std::cerr << "GET!\n";
-          break;
-        }
-      }
+      client->SendRequest(request);
+      client->RecvReply();
     }
   }
   return 0;
