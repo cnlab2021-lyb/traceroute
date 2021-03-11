@@ -8,6 +8,7 @@
 #include <chrono>
 #include <iostream>
 #include <utility>
+#include <vector>
 
 in_addr_t LookUp(const char *domain) {
   hostent *host = gethostbyname(domain);
@@ -16,6 +17,8 @@ in_addr_t LookUp(const char *domain) {
     exit(1);
   }
   in_addr **addr_list = reinterpret_cast<in_addr **>(host->h_addr_list);
+  int num_ip = 0;
+  while (addr_list[num_ip]) num_ip++;
   if (!addr_list || !addr_list[0]) {
     std::cerr << "traceroute: unknown host " << domain << "\n";
     exit(1);
@@ -26,31 +29,42 @@ in_addr_t LookUp(const char *domain) {
 enum Mode { ICMP, TCP, UDP };
 
 struct Config {
-  Mode mode;
-  int nqueries;
+  Mode mode = ICMP;
+  int nqueries = 3;
+  int first_ttl = 1;
   char *hostname;
 };
+
+[[noreturn]] void PrintUsage() {
+  std::cerr << "Usage:\n";
+  std::cerr << "  traceroute [ -f first_ttl ] [ -q nqueries ] [ -t/-u ] host\n";
+  exit(1);
+}
 
 Config ParseArg(int argc, char *argv[]) {
   bool tcp = false, udp = false;
   Config config{};
-  for (int opt = getopt(argc, argv, "qtu"); opt != -1;
-       opt = getopt(argc, argv, "qtu")) {
+
+  auto ParseInt = [&]() {
+    if (optind == argc) PrintUsage();
+    try {
+      return std::atoi(argv[optind++]);
+    } catch (...) {
+      PrintUsage();
+    }
+  };
+
+  for (int opt = getopt(argc, argv, "fqtu"); opt != -1;
+       opt = getopt(argc, argv, "fqtu")) {
     if (opt == 't') tcp = true;
     if (opt == 'u') udp = true;
-    if (opt == 'q') config.nqueries = std::atoi(argv[optind++]);
+
+    if (opt == 'f') config.first_ttl = ParseInt();
+    if (opt == 'q') config.nqueries = ParseInt();
   }
 
-  if (tcp && udp) {
-    std::cerr << "[Error] Cannot specify both TCP mode and UDP mode at the "
-                 "same time.\n";
-    exit(1);
-  }
+  if ((tcp && udp) || optind != argc - 1) PrintUsage();
 
-  if (optind != argc - 1) {
-    std::cerr << "[Usage] traceroute [-q nqueries] [-t/-u] hostname\n";
-    exit(1);
-  }
   config.mode = (tcp ? TCP : (udp ? UDP : ICMP));
   config.hostname = argv[optind];
   return config;
@@ -85,6 +99,7 @@ struct ICMPPacket {
 };
 
 int main(int argc, char *argv[]) {
+  static_assert(sizeof(ICMPPacket) == 8 && "Padding is not allowed.");
   auto config = ParseArg(argc, argv);
 
   struct sockaddr_in addr;
@@ -96,10 +111,13 @@ int main(int argc, char *argv[]) {
   std::cout << "traceroute to " << config.hostname << " ("
             << inet_ntoa(addr.sin_addr) << "), " << kMaxHop << " hops max\n";
 
-  for (int hop = 1; hop <= kMaxHop; ++hop) {
+  for (int hop = config.first_ttl; hop <= kMaxHop; ++hop) {
+    std::vector<std::chrono::time_point<std::chrono::system_clock>> send_time(
+        config.nqueries);
     for (int query = 0; query < config.nqueries; ++query) {
       // TODO: properly set up identifer and sequence number
       ICMPPacket request(0x7122, 0x1234);
+
       int fd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
       if (fd == -1) {
         perror("socket");
@@ -107,14 +125,16 @@ int main(int argc, char *argv[]) {
       }
 
       // Set TTL
-      if (setsockopt(fd, IPPROTO_IP, IP_TTL, reinterpret_cast<const void *>(&hop),
-                     sizeof(hop)) == -1) {
+      if (setsockopt(fd, IPPROTO_IP, IP_TTL,
+                     reinterpret_cast<const void *>(&hop), sizeof(hop)) == -1) {
         perror("setsockopt");
         exit(1);
       }
 
-      if (sendto(fd, reinterpret_cast<const void *>(&request), sizeof(request), 0,
-                 reinterpret_cast<const struct sockaddr *>(&addr),
+      // Send ICMP packet
+      send_time[query] = std::chrono::system_clock::now();
+      if (sendto(fd, reinterpret_cast<const void *>(&request), sizeof(request),
+                 0, reinterpret_cast<const struct sockaddr *>(&addr),
                  sizeof(addr)) == -1) {
         perror("sendto");
         exit(1);
