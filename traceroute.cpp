@@ -25,12 +25,20 @@ in_addr_t LookUp(const char *domain) {
 
 enum Mode { ICMP, TCP, UDP };
 
-std::pair<Mode, char *> ParseArg(int argc, char *argv[]) {
+struct Config {
+  Mode mode;
+  int nqueries;
+  char *hostname;
+};
+
+Config ParseArg(int argc, char *argv[]) {
   bool tcp = false, udp = false;
-  for (int opt = getopt(argc, argv, "tu"); opt != -1;
-       opt = getopt(argc, argv, "tu")) {
+  Config config{};
+  for (int opt = getopt(argc, argv, "qtu"); opt != -1;
+       opt = getopt(argc, argv, "qtu")) {
     if (opt == 't') tcp = true;
     if (opt == 'u') udp = true;
+    if (opt == 'q') config.nqueries = std::atoi(argv[optind++]);
   }
 
   if (tcp && udp) {
@@ -40,11 +48,12 @@ std::pair<Mode, char *> ParseArg(int argc, char *argv[]) {
   }
 
   if (optind != argc - 1) {
-    std::cerr << "[Usage] traceroute [-t] [-u] hostname\n";
+    std::cerr << "[Usage] traceroute [-q nqueries] [-t/-u] hostname\n";
     exit(1);
   }
-  Mode mode = (tcp ? TCP : (udp ? UDP : ICMP));
-  return std::make_pair(mode, argv[optind]);
+  config.mode = (tcp ? TCP : (udp ? UDP : ICMP));
+  config.hostname = argv[optind];
+  return config;
 }
 
 struct ICMPPacket {
@@ -60,6 +69,8 @@ struct ICMPPacket {
   uint16_t identifier;
   uint16_t sequence_number;
 
+  ICMPPacket() = default;
+
   ICMPPacket(uint16_t identifier, uint16_t sequence_number)
       : type(kEchoRequest),
         code(0x0),
@@ -74,39 +85,40 @@ struct ICMPPacket {
 };
 
 int main(int argc, char *argv[]) {
-  auto [mode, host] = ParseArg(argc, argv);
+  auto config = ParseArg(argc, argv);
 
   struct sockaddr_in addr;
   addr.sin_port = htons(7);
   addr.sin_family = AF_INET;
-  addr.sin_addr.s_addr = LookUp(host);
+  addr.sin_addr.s_addr = LookUp(config.hostname);
 
   constexpr int kMaxHop = 64;
-  std::cout << "traceroute to " << host << " (" << inet_ntoa(addr.sin_addr)
-            << "), " << kMaxHop << " hops max\n";
+  std::cout << "traceroute to " << config.hostname << " ("
+            << inet_ntoa(addr.sin_addr) << "), " << kMaxHop << " hops max\n";
 
   for (int hop = 1; hop <= kMaxHop; ++hop) {
-    // TODO: properly set up identifer and sequence number
-    ICMPPacket packet(0x7122, 0x1234);
-    int fd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
-    if (fd == -1) {
-      perror("socket");
-      exit(1);
-    }
+    for (int query = 0; query < config.nqueries; ++query) {
+      // TODO: properly set up identifer and sequence number
+      ICMPPacket request(0x7122, 0x1234);
+      int fd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+      if (fd == -1) {
+        perror("socket");
+        exit(1);
+      }
 
-    // Set TTL
-    if (setsockopt(fd, IPPROTO_IP, IP_TTL, reinterpret_cast<const void *>(&hop),
-                   sizeof(hop)) == -1) {
-      perror("setsockopt");
-      exit(1);
-    }
+      // Set TTL
+      if (setsockopt(fd, IPPROTO_IP, IP_TTL, reinterpret_cast<const void *>(&hop),
+                     sizeof(hop)) == -1) {
+        perror("setsockopt");
+        exit(1);
+      }
 
-    ssize_t sz =
-        sendto(fd, reinterpret_cast<const void *>(&packet), sizeof(packet), 0,
-               reinterpret_cast<const struct sockaddr *>(&addr), sizeof(addr));
-    if (sz == -1) {
-      perror("sendto");
-      exit(1);
+      if (sendto(fd, reinterpret_cast<const void *>(&request), sizeof(request), 0,
+                 reinterpret_cast<const struct sockaddr *>(&addr),
+                 sizeof(addr)) == -1) {
+        perror("sendto");
+        exit(1);
+      }
     }
   }
   return 0;
