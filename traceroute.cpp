@@ -267,7 +267,20 @@ Packet BuildPacket(Mode mode) {
   __builtin_unreachable();
 }
 
+std::unique_ptr<TraceRouteClient> BuildClient(const Config &config) {
+  switch (config.mode) {
+    case UDP:
+      return std::make_unique<UDPClient>(config.hostname);
+    case TCP:
+      return std::make_unique<TCPClient>(config.hostname);
+    case ICMP:
+      return std::make_unique<ICMPClient>(config.hostname);
+  }
+  __builtin_unreachable();
+}
+
 }  // namespace
+
 int main(int argc, char *argv[]) {
   static_assert(sizeof(ICMPPacket) == ICMPPacket::kPacketSize,
                 "Padding is not allowed.");
@@ -277,8 +290,7 @@ int main(int argc, char *argv[]) {
   // std::cout << "traceroute to " << config.hostname << " ("
   //           << inet_ntoa(addr.sin_addr) << "), " << kMaxHop << " hops max\n";
 
-  std::unique_ptr<TraceRouteClient> client =
-      std::make_unique<ICMPClient>(config.hostname);
+  std::unique_ptr<TraceRouteClient> client = BuildClient(config);
   for (int hop = config.first_ttl; hop <= kMaxHop; ++hop) {
     std::vector<std::chrono::time_point<std::chrono::steady_clock>> send_time(
         config.nqueries);
