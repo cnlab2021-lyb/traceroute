@@ -12,6 +12,7 @@
 #include <iostream>
 #include <memory>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace {
@@ -109,6 +110,12 @@ struct alignas(2) ICMPPacket {
   }
 };
 
+// TODO(waynetu): Implement TCP and UDP packets.
+struct TCPPacket {};
+struct UDPPacket {};
+
+using Packet = std::variant<ICMPPacket, TCPPacket, UDPPacket>;
+
 [[noreturn]] void PrintError(const char *s = nullptr) {
   perror(s);
   exit(1);
@@ -138,8 +145,13 @@ class TraceRouteClient {
 
   virtual ~TraceRouteClient() = default;
 
-  virtual void InitSocket(int ttl) = 0;
-  virtual void SendRequest(ICMPPacket packet) = 0;
+  void InitSocket(int ttl) {
+    if (setsockopt(fd_, IPPROTO_IP, IP_TTL,
+                   reinterpret_cast<const void *>(&ttl), sizeof(ttl)) < 0)
+      PrintError("setsockopt");
+  }
+
+  virtual void SendRequest(Packet packet) = 0;
 
   [[nodiscard]] std::pair<std::chrono::time_point<std::chrono::steady_clock>,
                           bool>
@@ -187,6 +199,21 @@ class TraceRouteClient {
   }
 };
 
+class TCPClient : public TraceRouteClient {
+ public:
+  TCPClient(char *host) : TraceRouteClient(host, AF_INET, SOCK_STREAM, 0) {}
+
+  ~TCPClient() override { close(fd_); }
+
+  void SendRequest(Packet packet) override {
+    assert(std::holds_alternative<TCPPacket>(packet) &&
+           "Expecting TCP packet.");
+    if (connect(fd_, reinterpret_cast<const struct sockaddr *>(&addr_),
+                sizeof(addr_)) < 0)
+      PrintError("connect");
+  }
+};
+
 class ICMPClient : public TraceRouteClient {
  public:
   explicit ICMPClient(char *host)
@@ -200,22 +227,47 @@ class ICMPClient : public TraceRouteClient {
 
   ~ICMPClient() override { close(fd_); }
 
-  void InitSocket(int ttl) override {
-    if (setsockopt(fd_, IPPROTO_IP, IP_TTL,
-                   reinterpret_cast<const void *>(&ttl), sizeof(ttl)) < 0)
-      PrintError("setsockopt");
-  }
-
-  void SendRequest(ICMPPacket packet) override {
-    if (sendto(fd_, reinterpret_cast<const void *>(&packet), sizeof(packet), 0,
+  void SendRequest(Packet packet) override {
+    assert(std::holds_alternative<ICMPPacket>(packet) &&
+           "Expecting ICMP packet.");
+    auto &icmp = std::get<ICMPPacket>(packet);
+    if (sendto(fd_, reinterpret_cast<const void *>(&icmp), sizeof(icmp), 0,
                reinterpret_cast<const struct sockaddr *>(&addr_),
                sizeof(addr_)) < 0)
       PrintError("sendto");
   }
 };
 
-}  // namespace
+class UDPClient : public TraceRouteClient {
+ public:
+  UDPClient(char *host) : TraceRouteClient(host, AF_INET, SOCK_DGRAM, 0) {}
 
+  ~UDPClient() { close(fd_); }
+
+  void SendRequest(Packet packet) override {
+    assert(std::holds_alternative<UDPPacket>(packet) &&
+           "Expecting UDP packet.");
+    auto &udp = std::get<UDPPacket>(packet);
+    if (sendto(fd_, reinterpret_cast<const void *>(&udp), sizeof(udp), 0,
+               reinterpret_cast<const struct sockaddr *>(&addr_),
+               sizeof(addr_)) < 0)
+      PrintError("sendto");
+  }
+};
+
+Packet BuildPacket(Mode mode) {
+  switch (mode) {
+    case TCP:
+      return TCPPacket{};
+    case UDP:
+      return UDPPacket{};
+    case ICMP:
+      return ICMPPacket(kIcmpIdentifier, kIcmpSeqNum);
+  }
+  __builtin_unreachable();
+}
+
+}  // namespace
 int main(int argc, char *argv[]) {
   static_assert(sizeof(ICMPPacket) == ICMPPacket::kPacketSize,
                 "Padding is not allowed.");
@@ -235,15 +287,14 @@ int main(int argc, char *argv[]) {
     bool is_exceed = true;
     for (int query = 0; query < config.nqueries; ++query) {
       // TODO(waynetu): properly set up identifer and sequence number
-      ICMPPacket request(kIcmpIdentifier, kIcmpSeqNum);
       client->InitSocket(hop);
       send_time[query] = std::chrono::steady_clock::now();
-      client->SendRequest(request);
+      auto packet = BuildPacket(config.mode);
+      client->SendRequest(packet);
       bool ex{};
       std::tie(recv_time[query], ex) = client->RecvReply();
       is_exceed &= ex;
     }
-
     if (!is_exceed) break;
   }
 }
