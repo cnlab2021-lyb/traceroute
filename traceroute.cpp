@@ -99,9 +99,9 @@ struct alignas(2) ICMPPacket {
         sequence_number(htons(sequence_number)) {
     uint32_t sum = (static_cast<uint32_t>(type) << 8) + code + identifier +
                    sequence_number;
-    auto high = static_cast<uint16_t>(sum >> 16);
-    auto low = static_cast<uint16_t>(sum & ((1U << 16) - 1));
-    checksum = htons(~(high + low));
+    auto high = static_cast<uint32_t>(sum >> 16);
+    auto low = static_cast<uint32_t>(sum & ((1U << 16) - 1));
+    checksum = htons(static_cast<uint16_t>(~(high + low)));
   }
 };
 
