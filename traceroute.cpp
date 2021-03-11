@@ -102,8 +102,7 @@ struct alignas(2) ICMPPacket {
         code(0x0),
         identifier(htons(id)),
         sequence_number(htons(seq)) {
-    uint32_t sum = (static_cast<uint32_t>(type) << 8) + code + id +
-                   seq;
+    uint32_t sum = (static_cast<uint32_t>(type) << 8) + code + id + seq;
     auto high = static_cast<uint32_t>(sum >> 16);
     auto low = static_cast<uint32_t>(sum & ((1U << 16) - 1));
     checksum = htons(static_cast<uint16_t>(~(high + low)));
@@ -117,8 +116,8 @@ struct alignas(2) ICMPPacket {
 
 class TraceRouteClient {
  protected:
-  struct sockaddr_in addr_{};  // NOLINT
-  int fd_{};  // NOLINT
+  struct sockaddr_in addr_ {};  // NOLINT
+  int fd_{};                    // NOLINT
 
  public:
   TraceRouteClient() = default;
@@ -126,8 +125,8 @@ class TraceRouteClient {
   // XXX(wp): Probably implement these later?
   TraceRouteClient(const TraceRouteClient &other) = delete;
   TraceRouteClient(TraceRouteClient &&other) = delete;
-  TraceRouteClient& operator=(const TraceRouteClient &other) = delete;
-  TraceRouteClient& operator=(TraceRouteClient &&other) = delete;
+  TraceRouteClient &operator=(const TraceRouteClient &other) = delete;
+  TraceRouteClient &operator=(TraceRouteClient &&other) = delete;
 
   TraceRouteClient(char *host, int domain, int type, int protocol)
       : fd_(socket(domain, type, protocol)) {
@@ -142,8 +141,8 @@ class TraceRouteClient {
   virtual void InitSocket(int ttl) = 0;
   virtual void SendRequest(ICMPPacket packet) = 0;
 
-  [[nodiscard]]
-  std::pair<std::chrono::time_point<std::chrono::steady_clock>, bool>
+  [[nodiscard]] std::pair<std::chrono::time_point<std::chrono::steady_clock>,
+                          bool>
   RecvReply() const {
     while (true) {
       std::array<char, kIpHeaderSize + ICMPPacket::kPacketSize + 64> buffer{};
@@ -196,8 +195,8 @@ class ICMPClient : public TraceRouteClient {
   // XXX(wp): Probably implement these later?
   ICMPClient(const ICMPClient &other) = delete;
   ICMPClient(ICMPClient &&other) = delete;
-  ICMPClient& operator=(const ICMPClient &other) = delete;
-  ICMPClient& operator=(ICMPClient &&other) = delete;
+  ICMPClient &operator=(const ICMPClient &other) = delete;
+  ICMPClient &operator=(ICMPClient &&other) = delete;
 
   ~ICMPClient() override { close(fd_); }
 
