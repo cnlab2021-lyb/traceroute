@@ -161,7 +161,8 @@ class TraceRouteClient {
       memcpy(&recv, buffer.data() + kIpHeaderSize, sizeof(recv));
       recv.identifier = ntohs(recv.identifier);
       recv.sequence_number = ntohs(recv.sequence_number);
-      // TODO(wp): Measure time
+      // TODO(wp): Handle timeouts
+      // TODO(wp): Handle replies other than ICMP echo
       if (recv.identifier == kIcmpIdentifier &&
           recv.sequence_number == kIcmpSeqNum) {
         if (recv.type == ICMPPacket::kEchoReply) {
