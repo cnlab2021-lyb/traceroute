@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstring>
 #include <functional>
+#include <iomanip>
 #include <iostream>
 #include <memory>
 #include <utility>
@@ -137,6 +138,7 @@ struct TCPPacket {};
 struct UDPPacket {};
 
 using Packet = std::variant<ICMPPacket, TCPPacket, UDPPacket>;
+using TimePoint = std::chrono::time_point<std::chrono::steady_clock>;
 
 class TraceRouteClient {
  protected:
@@ -174,9 +176,10 @@ class TraceRouteClient {
   /// - Source IP address
   /// - Time when the packet is received
   /// - Whether the ICMP packet is of type Time Exceeded
-  [[nodiscard]] virtual std::tuple<
-      uint32_t, std::chrono::time_point<std::chrono::steady_clock>, bool>
-  RecvReply() const {}
+  //
+  // TODO(waynetu): Remove default implementation
+  [[nodiscard]] virtual std::tuple<uint32_t, TimePoint, bool> RecvReply()
+      const {}
 
   const char *GetAddress() const { return inet_ntoa(addr_.sin_addr); }
 };
@@ -220,9 +223,8 @@ class ICMPClient : public TraceRouteClient {
       PrintError("sendto");
   }
 
-  [[nodiscard]] std::tuple<
-      uint32_t, std::chrono::time_point<std::chrono::steady_clock>, bool>
-  RecvReply() const override {
+  [[nodiscard]] std::tuple<uint32_t, TimePoint, bool> RecvReply()
+      const override {
     while (true) {
       std::array<char, kIpHeaderSize + ICMPPacket::kPacketSize + 64> buffer{};
       IPHeader header{};
@@ -309,6 +311,33 @@ std::unique_ptr<TraceRouteClient> BuildClient(const Config &config) {
   __builtin_unreachable();
 }
 
+class TraceRouteLogger {
+  int ttl_;
+  uint32_t previous_ip_;
+
+ public:
+  TraceRouteLogger(int ttl) : ttl_(ttl), previous_ip_(-1U) {}
+  ~TraceRouteLogger() { std::cout << "\n"; }
+
+  void Print(uint32_t ip, const TimePoint &send_time, const TimePoint &recv_time) {
+    // First reply
+    if (previous_ip_ == -1U) std::cout << std::setw(2) << ttl_ << "  ";
+    if (ip != previous_ip_) {
+      if (previous_ip_ != -1U) std::cout << "\n    ";
+      // TODO(waynetu): Perform DNS reverse resolution
+      std::cout << inet_ntoa(in_addr{ip});
+    }
+    std::cout << "  ";
+    auto time_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            recv_time - send_time)
+                            .count();
+    std::cout << std::fixed << std::setprecision(3)
+              << static_cast<double>(time_elapsed) / 1000 << " ms";
+    previous_ip_ = ip;
+  }
+
+};
+
 }  // namespace
 
 int main(int argc, char *argv[]) {
@@ -323,18 +352,18 @@ int main(int argc, char *argv[]) {
             << client->GetAddress() << "), " << kMaxHop << " hops max\n";
 
   for (int hop = config.first_ttl; hop <= kMaxHop; ++hop) {
-    std::vector<std::chrono::time_point<std::chrono::steady_clock>> send_time(
-        config.nqueries);
     bool is_exceed = true;
+    TraceRouteLogger logger(hop);
+    // XXX(waynetu): (Improvement) Send all requests before receiving replies.
     for (int query = 0; query < config.nqueries; ++query) {
       // TODO(waynetu): properly set up identifer and sequence number
       client->InitSocket(hop);
-      send_time[query] = std::chrono::steady_clock::now();
+      auto send_time = std::chrono::steady_clock::now();
       auto packet = BuildPacket(config.mode);
       client->SendRequest(packet);
       auto [source_ip, recv_time, ex] = client->RecvReply();
-      std::cout << inet_ntoa(in_addr{source_ip}) << "\n";
       is_exceed &= ex;
+      logger.Print(source_ip, send_time, recv_time);
     }
 
     // Destination reached
