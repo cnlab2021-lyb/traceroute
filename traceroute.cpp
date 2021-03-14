@@ -93,19 +93,6 @@ Config ParseArg(int argc, char *argv[]) {
   return config;
 }
 
-struct alignas(4) IPHeader {
-  uint8_t version;  // Version/IHL
-  uint8_t type;     // Type of service
-  uint16_t length;
-  uint16_t identification;
-  uint16_t flags;
-  uint8_t ttl;
-  uint8_t protocol;
-  uint16_t checksum;
-  uint32_t source_ip;
-  uint32_t destination_ip;
-};
-
 struct alignas(2) ICMPPacket {
   static constexpr uint8_t kEchoReply = 0x0;
   static constexpr uint8_t kEchoRequest = 0x8;
@@ -187,8 +174,8 @@ class TraceRouteClient {
   /// - Whether the reply has timed out
   //
   // TODO(waynetu): Remove default implementation
-  [[nodiscard]] virtual std::tuple<uint32_t, TimePoint, bool, bool> RecvReply()
-      const {}
+  [[nodiscard]] virtual std::tuple<struct sockaddr, TimePoint, bool, bool>
+  RecvReply() const {}
 
   const char *GetAddress() const { return inet_ntoa(addr_.sin_addr); }
 };
@@ -232,24 +219,22 @@ class ICMPClient : public TraceRouteClient {
       PrintError("sendto");
   }
 
-  [[nodiscard]] std::tuple<uint32_t, TimePoint, bool, bool> RecvReply()
-      const override {
+  [[nodiscard]] std::tuple<struct sockaddr, TimePoint, bool, bool>
+  RecvReply() const override {
     while (true) {
       std::array<char, kIpHeaderSize + ICMPPacket::kPacketSize + 64> buffer{};
-      IPHeader header{};
       ICMPPacket recv{};
-      struct sockaddr_in recv_addr {};
+      struct sockaddr recv_addr {};
       socklen_t recv_addr_len = sizeof(recv_addr);
       auto recv_bytes = recvfrom(
           fd_, reinterpret_cast<void *>(buffer.data()), buffer.size(), 0,
           reinterpret_cast<struct sockaddr *>(&recv_addr), &recv_addr_len);
       auto recv_time = ClockType::now();
       if (recv_bytes == -1) {
-        if (errno == EAGAIN) return std::make_tuple(0U, recv_time, true, true);
+        if (errno == EAGAIN)
+          return std::make_tuple(sockaddr{}, recv_time, true, true);
         PrintError("recvfrom");
       }
-      // Extract IP header
-      memcpy(&header, buffer.data(), sizeof(header));
       // Extract ICMP content
       memcpy(&recv, buffer.data() + kIpHeaderSize, sizeof(recv));
       recv.identifier = ntohs(recv.identifier);
@@ -260,7 +245,7 @@ class ICMPClient : public TraceRouteClient {
           recv.sequence_number == kIcmpSeqNum) {
         if (recv.type == ICMPPacket::kEchoReply) {
           std::cerr << "GET!\n";
-          return std::make_tuple(header.source_ip, recv_time, false, false);
+          return std::make_tuple(recv_addr, recv_time, false, false);
         }
       }
       if (recv.type == ICMPPacket::kTimeExceed) {
@@ -274,7 +259,7 @@ class ICMPClient : public TraceRouteClient {
         if (orig.identifier == kIcmpIdentifier &&
             orig.sequence_number == kIcmpSeqNum) {
           std::cerr << "Exceed!\n";
-          return std::make_tuple(header.source_ip, recv_time, true, false);
+          return std::make_tuple(recv_addr, recv_time, true, false);
         }
       }
     }
@@ -325,20 +310,24 @@ std::unique_ptr<TraceRouteClient> BuildClient(const Config &config) {
 
 class TraceRouteLogger {
   int ttl_;
-  uint32_t previous_ip_;
+  struct sockaddr previous_ip_;
+  bool first_record_;
 
  public:
-  explicit TraceRouteLogger(int ttl) : ttl_(ttl), previous_ip_(-1U) {}
+  explicit TraceRouteLogger(int ttl) : ttl_(ttl), first_record_(true) {}
   ~TraceRouteLogger() { std::cout << "\n"; }
 
-  void Print(uint32_t ip, const TimePoint &send_time,
+  void Print(struct sockaddr ip, const TimePoint &send_time,
              const TimePoint &recv_time, bool timeout) {
     // First reply
-    if (previous_ip_ == -1U) std::cout << std::setw(2) << ttl_ << "  ";
-    if (ip != previous_ip_ && !timeout) {
-      if (previous_ip_ != -1U) std::cout << "\n    ";
-      // TODO(waynetu): Perform DNS reverse resolution
-      std::cout << inet_ntoa(in_addr{ip});
+    if (first_record_) std::cout << std::setw(2) << ttl_ << "  ";
+    if (first_record_ && !timeout) {
+      if (!first_record_) std::cout << "\n    ";
+      char hostname[30];
+      getnameinfo(&ip, sizeof(ip), hostname, sizeof(hostname), nullptr, 0, 0);
+      std::cout << hostname << " ("
+                << inet_ntoa(reinterpret_cast<sockaddr_in *>(&ip)->sin_addr)
+                << ")";
     }
     std::cout << "  ";
     if (timeout) {
@@ -351,14 +340,14 @@ class TraceRouteLogger {
                 << static_cast<double>(time_elapsed) / 1000 << " ms";
       previous_ip_ = ip;
     }
+    first_record_ = false;
   }
 };
 
 }  // namespace
 
 int main(int argc, char *argv[]) {
-  static_assert(sizeof(ICMPPacket) == ICMPPacket::kPacketSize &&
-                    sizeof(IPHeader) == kIpHeaderSize,
+  static_assert(sizeof(ICMPPacket) == ICMPPacket::kPacketSize,
                 "Padding is not allowed.");
   auto config = ParseArg(argc, argv);
 
