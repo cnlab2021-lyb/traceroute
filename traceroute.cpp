@@ -308,6 +308,11 @@ std::unique_ptr<TraceRouteClient> BuildClient(const Config &config) {
   __builtin_unreachable();
 }
 
+bool operator!=(const struct sockaddr &lhs, const struct sockaddr &rhs) {
+  return lhs.sa_family != rhs.sa_family ||
+         memcmp(lhs.sa_data, rhs.sa_data, sizeof(lhs.sa_data));
+}
+
 class TraceRouteLogger {
   int ttl_;
   struct sockaddr previous_ip_;
@@ -321,7 +326,7 @@ class TraceRouteLogger {
              const TimePoint &recv_time, bool timeout) {
     // First reply
     if (first_record_) std::cout << std::setw(2) << ttl_ << "  ";
-    if (first_record_ && !timeout) {
+    if (ip != previous_ip_ && !timeout) {
       if (!first_record_) std::cout << "\n    ";
       char hostname[30];
       getnameinfo(&ip, sizeof(ip), hostname, sizeof(hostname), nullptr, 0, 0);
