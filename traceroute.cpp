@@ -56,6 +56,11 @@ struct Config {
   exit(1);
 }
 
+[[noreturn]] void PrintError(const char *s = nullptr) {
+  perror(s);
+  exit(1);
+}
+
 Config ParseArg(int argc, char *argv[]) {
   bool tcp = false, udp = false;
   Config config{};
@@ -85,6 +90,19 @@ Config ParseArg(int argc, char *argv[]) {
   config.hostname = argv[optind];
   return config;
 }
+
+struct alignas(4) IPHeader {
+  uint8_t version;  // Version/IHL
+  uint8_t type;     // Type of service
+  uint16_t length;
+  uint16_t identification;
+  uint16_t flags;
+  uint8_t ttl;
+  uint8_t protocol;
+  uint16_t checksum;
+  uint32_t source_ip;
+  uint32_t destination_ip;
+};
 
 struct alignas(2) ICMPPacket {
   static constexpr uint8_t kEchoReply = 0x0;
@@ -120,11 +138,6 @@ struct UDPPacket {};
 
 using Packet = std::variant<ICMPPacket, TCPPacket, UDPPacket>;
 
-[[noreturn]] void PrintError(const char *s = nullptr) {
-  perror(s);
-  exit(1);
-}
-
 class TraceRouteClient {
  protected:
   struct sockaddr_in addr_ {};  // NOLINT
@@ -157,55 +170,21 @@ class TraceRouteClient {
 
   virtual void SendRequest(Packet packet) = 0;
 
-  [[nodiscard]] std::pair<std::chrono::time_point<std::chrono::steady_clock>,
-                          bool>
-  RecvReply() const {
-    while (true) {
-      std::array<char, kIpHeaderSize + ICMPPacket::kPacketSize + 64> buffer{};
-      ICMPPacket recv{};
-      struct sockaddr_in recv_addr {};
-      socklen_t recv_addr_len = sizeof(recv_addr);
-      auto recv_bytes = recvfrom(
-          fd_, reinterpret_cast<void *>(buffer.data()), buffer.size(), 0,
-          reinterpret_cast<struct sockaddr *>(&recv_addr), &recv_addr_len);
-      auto recv_time = std::chrono::steady_clock::now();
-      if (recv_bytes == -1) {
-        PrintError("recvfrom");
-      }
-      // Extract ICMP content
-      memcpy(&recv, buffer.data() + kIpHeaderSize, sizeof(recv));
-      recv.identifier = ntohs(recv.identifier);
-      recv.sequence_number = ntohs(recv.sequence_number);
-      // TODO(wp): Handle timeouts
-      // TODO(wp): Handle replies other than ICMP echo
-      if (recv.identifier == kIcmpIdentifier &&
-          recv.sequence_number == kIcmpSeqNum) {
-        if (recv.type == ICMPPacket::kEchoReply) {
-          std::cerr << "GET!\n";
-          return {recv_time, false};
-        }
-      }
-      if (recv.type == ICMPPacket::kTimeExceed) {
-        ICMPPacket orig{};
-        memcpy(&orig,
-               buffer.data() + kIpHeaderSize + ICMPPacket::kPacketSize +
-                   kIpHeaderSize,
-               sizeof(orig));
-        orig.identifier = ntohs(orig.identifier);
-        orig.sequence_number = ntohs(orig.sequence_number);
-        if (orig.identifier == kIcmpIdentifier &&
-            orig.sequence_number == kIcmpSeqNum) {
-          std::cerr << "Exceed!\n";
-          return {recv_time, true};
-        }
-      }
-    }
-  }
+  /// Return a tuple consisting of
+  /// - Source IP address
+  /// - Time when the packet is received
+  /// - Whether the ICMP packet is of type Time Exceeded
+  [[nodiscard]] virtual std::tuple<
+      uint32_t, std::chrono::time_point<std::chrono::steady_clock>, bool>
+  RecvReply() const {}
+
+  const char *GetAddress() const { return inet_ntoa(addr_.sin_addr); }
 };
 
 class TCPClient : public TraceRouteClient {
  public:
-  TCPClient(char *host) : TraceRouteClient(host, AF_INET, SOCK_STREAM, 0) {}
+  explicit TCPClient(char *host)
+      : TraceRouteClient(host, AF_INET, SOCK_STREAM, 0) {}
 
   ~TCPClient() override { close(fd_); }
 
@@ -240,11 +219,58 @@ class ICMPClient : public TraceRouteClient {
                sizeof(addr_)) < 0)
       PrintError("sendto");
   }
+
+  [[nodiscard]] std::tuple<
+      uint32_t, std::chrono::time_point<std::chrono::steady_clock>, bool>
+  RecvReply() const override {
+    while (true) {
+      std::array<char, kIpHeaderSize + ICMPPacket::kPacketSize + 64> buffer{};
+      IPHeader header{};
+      ICMPPacket recv{};
+      struct sockaddr_in recv_addr {};
+      socklen_t recv_addr_len = sizeof(recv_addr);
+      auto recv_bytes = recvfrom(
+          fd_, reinterpret_cast<void *>(buffer.data()), buffer.size(), 0,
+          reinterpret_cast<struct sockaddr *>(&recv_addr), &recv_addr_len);
+      auto recv_time = std::chrono::steady_clock::now();
+      if (recv_bytes == -1) PrintError("recvfrom");
+      // Extract IP header
+      memcpy(&header, buffer.data(), sizeof(header));
+      // Extract ICMP content
+      memcpy(&recv, buffer.data() + kIpHeaderSize, sizeof(recv));
+      recv.identifier = ntohs(recv.identifier);
+      recv.sequence_number = ntohs(recv.sequence_number);
+      // TODO(wp): Handle timeouts
+      // TODO(wp): Handle replies other than ICMP echo
+      if (recv.identifier == kIcmpIdentifier &&
+          recv.sequence_number == kIcmpSeqNum) {
+        if (recv.type == ICMPPacket::kEchoReply) {
+          std::cerr << "GET!\n";
+          return std::make_tuple(header.source_ip, recv_time, false);
+        }
+      }
+      if (recv.type == ICMPPacket::kTimeExceed) {
+        ICMPPacket orig{};
+        memcpy(&orig,
+               buffer.data() + kIpHeaderSize + ICMPPacket::kPacketSize +
+                   kIpHeaderSize,
+               sizeof(orig));
+        orig.identifier = ntohs(orig.identifier);
+        orig.sequence_number = ntohs(orig.sequence_number);
+        if (orig.identifier == kIcmpIdentifier &&
+            orig.sequence_number == kIcmpSeqNum) {
+          std::cerr << "Exceed!\n";
+          return std::make_tuple(header.source_ip, recv_time, true);
+        }
+      }
+    }
+  }
 };
 
 class UDPClient : public TraceRouteClient {
  public:
-  UDPClient(char *host) : TraceRouteClient(host, AF_INET, SOCK_DGRAM, 0) {}
+  explicit UDPClient(char *host)
+      : TraceRouteClient(host, AF_INET, SOCK_DGRAM, 0) {}
 
   ~UDPClient() { close(fd_); }
 
@@ -286,7 +312,8 @@ std::unique_ptr<TraceRouteClient> BuildClient(const Config &config) {
 }  // namespace
 
 int main(int argc, char *argv[]) {
-  static_assert(sizeof(ICMPPacket) == ICMPPacket::kPacketSize,
+  static_assert(sizeof(ICMPPacket) == ICMPPacket::kPacketSize &&
+                    sizeof(IPHeader) == kIpHeaderSize,
                 "Padding is not allowed.");
   auto config = ParseArg(argc, argv);
 
@@ -298,8 +325,6 @@ int main(int argc, char *argv[]) {
   for (int hop = config.first_ttl; hop <= kMaxHop; ++hop) {
     std::vector<std::chrono::time_point<std::chrono::steady_clock>> send_time(
         config.nqueries);
-    std::vector<std::chrono::time_point<std::chrono::steady_clock>> recv_time(
-        config.nqueries);
     bool is_exceed = true;
     for (int query = 0; query < config.nqueries; ++query) {
       // TODO(waynetu): properly set up identifer and sequence number
@@ -307,10 +332,12 @@ int main(int argc, char *argv[]) {
       send_time[query] = std::chrono::steady_clock::now();
       auto packet = BuildPacket(config.mode);
       client->SendRequest(packet);
-      bool ex{};
-      std::tie(recv_time[query], ex) = client->RecvReply();
+      auto [source_ip, recv_time, ex] = client->RecvReply();
+      std::cout << inet_ntoa(in_addr{source_ip}) << "\n";
       is_exceed &= ex;
     }
+
+    // Destination reached
     if (!is_exceed) break;
   }
 }
