@@ -20,7 +20,7 @@ namespace {
 constexpr int kIpHeaderSize = 20;
 constexpr int kIcmpIdentifier = 0x7122, kIcmpSeqNum = 0x1234;
 
-in_addr_t LookUp(const char *domain) {
+in_addr LookUp(const char *domain) {
   hostent *host = gethostbyname(domain);
   if (!host || !host->h_addr_list) {
     std::cerr << "traceroute: unknown host " << domain << "\n";
@@ -28,13 +28,17 @@ in_addr_t LookUp(const char *domain) {
   }
   auto **addr_list = reinterpret_cast<in_addr **>(host->h_addr_list);
   int num_ip = 0;
-  // cppcheck-suppress nullPointerRedundantCheck
-  while (addr_list[num_ip]) num_ip++;
   if (!addr_list || !addr_list[0]) {
     std::cerr << "traceroute: unknown host " << domain << "\n";
     exit(1);
   }
-  return addr_list[0]->s_addr;
+  while (addr_list[num_ip]) num_ip++;
+  if (num_ip > 1) {
+    std::cerr << "traceroute: Warning: " << domain
+              << " has multiple addresses; using " << inet_ntoa(*addr_list[0])
+              << "\n";
+  }
+  return *addr_list[0];
 }
 
 enum Mode { ICMP, TCP, UDP };
@@ -140,7 +144,7 @@ class TraceRouteClient {
     if (fd_ == -1) PrintError("socket");
     addr_.sin_port = htons(7);
     addr_.sin_family = AF_INET;
-    addr_.sin_addr.s_addr = LookUp(host);
+    addr_.sin_addr = LookUp(host);
   }
 
   virtual ~TraceRouteClient() = default;
@@ -287,10 +291,10 @@ int main(int argc, char *argv[]) {
   auto config = ParseArg(argc, argv);
 
   constexpr int kMaxHop = 64;
-  // std::cout << "traceroute to " << config.hostname << " ("
-  //           << inet_ntoa(addr.sin_addr) << "), " << kMaxHop << " hops max\n";
-
   std::unique_ptr<TraceRouteClient> client = BuildClient(config);
+  std::cout << "traceroute to " << config.hostname << " ("
+            << client->GetAddress() << "), " << kMaxHop << " hops max\n";
+
   for (int hop = config.first_ttl; hop <= kMaxHop; ++hop) {
     std::vector<std::chrono::time_point<std::chrono::steady_clock>> send_time(
         config.nqueries);
