@@ -20,6 +20,7 @@ namespace {
 
 constexpr int kIpHeaderSize = 20;
 constexpr int kIcmpIdentifier = 0x7122, kIcmpSeqNum = 0x1234;
+constexpr int kTimeout = 5;
 
 in_addr LookUp(const char *domain) {
   hostent *host = gethostbyname(domain);
@@ -138,7 +139,8 @@ struct TCPPacket {};
 struct UDPPacket {};
 
 using Packet = std::variant<ICMPPacket, TCPPacket, UDPPacket>;
-using TimePoint = std::chrono::time_point<std::chrono::steady_clock>;
+using ClockType = std::chrono::steady_clock;
+using TimePoint = std::chrono::time_point<ClockType>;
 
 class TraceRouteClient {
  protected:
@@ -167,7 +169,13 @@ class TraceRouteClient {
   void InitSocket(int ttl) {
     if (setsockopt(fd_, IPPROTO_IP, IP_TTL,
                    reinterpret_cast<const void *>(&ttl), sizeof(ttl)) < 0)
-      PrintError("setsockopt");
+      PrintError("setsockopt(ttl)");
+    struct timeval tv;
+    tv.tv_sec = kTimeout;
+    tv.tv_usec = 0;
+    if (setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO,
+                   reinterpret_cast<const void *>(&tv), sizeof(tv)) < 0)
+      PrintError("setsockopt(sendtime)");
   }
 
   virtual void SendRequest(Packet packet) = 0;
@@ -176,9 +184,10 @@ class TraceRouteClient {
   /// - Source IP address
   /// - Time when the packet is received
   /// - Whether the ICMP packet is of type Time Exceeded
+  /// - Whether the reply has timed out
   //
   // TODO(waynetu): Remove default implementation
-  [[nodiscard]] virtual std::tuple<uint32_t, TimePoint, bool> RecvReply()
+  [[nodiscard]] virtual std::tuple<uint32_t, TimePoint, bool, bool> RecvReply()
       const {}
 
   const char *GetAddress() const { return inet_ntoa(addr_.sin_addr); }
@@ -223,7 +232,7 @@ class ICMPClient : public TraceRouteClient {
       PrintError("sendto");
   }
 
-  [[nodiscard]] std::tuple<uint32_t, TimePoint, bool> RecvReply()
+  [[nodiscard]] std::tuple<uint32_t, TimePoint, bool, bool> RecvReply()
       const override {
     while (true) {
       std::array<char, kIpHeaderSize + ICMPPacket::kPacketSize + 64> buffer{};
@@ -234,8 +243,11 @@ class ICMPClient : public TraceRouteClient {
       auto recv_bytes = recvfrom(
           fd_, reinterpret_cast<void *>(buffer.data()), buffer.size(), 0,
           reinterpret_cast<struct sockaddr *>(&recv_addr), &recv_addr_len);
-      auto recv_time = std::chrono::steady_clock::now();
-      if (recv_bytes == -1) PrintError("recvfrom");
+      auto recv_time = ClockType::now();
+      if (recv_bytes == -1) {
+        if (errno == EAGAIN) return std::make_tuple(0U, recv_time, true, true);
+        PrintError("recvfrom");
+      }
       // Extract IP header
       memcpy(&header, buffer.data(), sizeof(header));
       // Extract ICMP content
@@ -248,7 +260,7 @@ class ICMPClient : public TraceRouteClient {
           recv.sequence_number == kIcmpSeqNum) {
         if (recv.type == ICMPPacket::kEchoReply) {
           std::cerr << "GET!\n";
-          return std::make_tuple(header.source_ip, recv_time, false);
+          return std::make_tuple(header.source_ip, recv_time, false, false);
         }
       }
       if (recv.type == ICMPPacket::kTimeExceed) {
@@ -262,7 +274,7 @@ class ICMPClient : public TraceRouteClient {
         if (orig.identifier == kIcmpIdentifier &&
             orig.sequence_number == kIcmpSeqNum) {
           std::cerr << "Exceed!\n";
-          return std::make_tuple(header.source_ip, recv_time, true);
+          return std::make_tuple(header.source_ip, recv_time, true, false);
         }
       }
     }
@@ -316,26 +328,30 @@ class TraceRouteLogger {
   uint32_t previous_ip_;
 
  public:
-  TraceRouteLogger(int ttl) : ttl_(ttl), previous_ip_(-1U) {}
+  explicit TraceRouteLogger(int ttl) : ttl_(ttl), previous_ip_(-1U) {}
   ~TraceRouteLogger() { std::cout << "\n"; }
 
-  void Print(uint32_t ip, const TimePoint &send_time, const TimePoint &recv_time) {
+  void Print(uint32_t ip, const TimePoint &send_time,
+             const TimePoint &recv_time, bool timeout) {
     // First reply
     if (previous_ip_ == -1U) std::cout << std::setw(2) << ttl_ << "  ";
-    if (ip != previous_ip_) {
+    if (ip != previous_ip_ && !timeout) {
       if (previous_ip_ != -1U) std::cout << "\n    ";
       // TODO(waynetu): Perform DNS reverse resolution
       std::cout << inet_ntoa(in_addr{ip});
     }
     std::cout << "  ";
-    auto time_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                            recv_time - send_time)
-                            .count();
-    std::cout << std::fixed << std::setprecision(3)
-              << static_cast<double>(time_elapsed) / 1000 << " ms";
-    previous_ip_ = ip;
+    if (timeout) {
+      std::cout << "*";
+    } else {
+      auto time_elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+                              recv_time - send_time)
+                              .count();
+      std::cout << std::fixed << std::setprecision(3)
+                << static_cast<double>(time_elapsed) / 1000 << " ms";
+      previous_ip_ = ip;
+    }
   }
-
 };
 
 }  // namespace
@@ -358,12 +374,12 @@ int main(int argc, char *argv[]) {
     for (int query = 0; query < config.nqueries; ++query) {
       // TODO(waynetu): properly set up identifer and sequence number
       client->InitSocket(hop);
-      auto send_time = std::chrono::steady_clock::now();
+      auto send_time = ClockType::now();
       auto packet = BuildPacket(config.mode);
       client->SendRequest(packet);
-      auto [source_ip, recv_time, ex] = client->RecvReply();
+      auto [source_ip, recv_time, ex, timeout] = client->RecvReply();
       is_exceed &= ex;
-      logger.Print(source_ip, send_time, recv_time);
+      logger.Print(source_ip, send_time, recv_time, timeout);
     }
 
     // Destination reached
