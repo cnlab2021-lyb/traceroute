@@ -92,12 +92,29 @@ Config ParseArg(int argc, char *argv[]) {
   return config;
 }
 
-struct alignas(2) ICMPPacket {
-  static constexpr uint8_t kEchoReply = 0x0;
-  static constexpr uint8_t kDestinationUnreachable = 0x3;
-  static constexpr uint8_t kEchoRequest = 0x8;
-  static constexpr uint8_t kTimeExceed = 11;
+namespace icmp {
 
+// type
+constexpr uint8_t kEchoReply = 0x0;
+constexpr uint8_t kDestinationUnreachable = 0x3;
+constexpr uint8_t kEchoRequest = 0x8;
+constexpr uint8_t kTimeExceed = 11;
+
+// code
+
+// Destination unreachable
+constexpr uint8_t kNetworkUnreachable = 0x0;
+constexpr uint8_t kHostUnreachable = 0x1;
+constexpr uint8_t kProtocolUnreachable = 0x2;
+constexpr uint8_t kPortUnreachable = 0x3;
+
+// Time exceeded
+constexpr uint8_t kTTLExpired = 0x0;
+constexpr uint8_t kFragmentReassemblyTimeExceeded = 0x1;
+
+}  // namespace icmp
+
+struct alignas(2) ICMPPacket {
   // type + code + checksum + identifier + seq
   static constexpr size_t kPacketSize = 8;
 
@@ -110,7 +127,7 @@ struct alignas(2) ICMPPacket {
   ICMPPacket() = default;
 
   ICMPPacket(uint16_t id, uint16_t seq)
-      : type(kEchoRequest),
+      : type(icmp::kEchoRequest),
         code(0x0),
         identifier(htons(id)),
         sequence_number(htons(seq)) {
@@ -249,12 +266,12 @@ class TCPClient : public TraceRouteClient {
       // TODO(wp): Handle replies other than ICMP echo
       if (recv.identifier == kIcmpIdentifier &&
           recv.sequence_number == kIcmpSeqNum) {
-        if (recv.type == ICMPPacket::kEchoReply) {
+        if (recv.type == icmp::kEchoReply) {
           std::cerr << "GET!\n";
           return std::make_tuple(recv_addr, recv_time, false, false);
         }
       }
-      if (recv.type == ICMPPacket::kTimeExceed) {
+      if (recv.type == icmp::kTimeExceed) {
         // TODO: Validate returned TCP packets.
         return std::make_tuple(recv_addr, recv_time, true, false);
       }
@@ -312,12 +329,15 @@ class ICMPClient : public TraceRouteClient {
       // TODO(wp): Handle replies other than ICMP echo
       if (recv.identifier == kIcmpIdentifier &&
           recv.sequence_number == kIcmpSeqNum) {
-        if (recv.type == ICMPPacket::kEchoReply) {
+        if (recv.type == icmp::kEchoReply) {
           std::cerr << "GET!\n";
           return std::make_tuple(recv_addr, recv_time, false, false);
         }
       }
-      if (recv.type == ICMPPacket::kTimeExceed) {
+      if (recv.type == icmp::kTimeExceed) {
+        if (recv.code == icmp::kFragmentReassemblyTimeExceeded) {
+          // TODO(waynetu): Unexpected case
+        }
         ICMPPacket orig{};
         memcpy(&orig,
                buffer.data() + kIpHeaderSize + ICMPPacket::kPacketSize +
@@ -336,7 +356,6 @@ class ICMPClient : public TraceRouteClient {
 };
 
 class UDPClient : public TraceRouteClient {
-  uint32_t data_;
   uint16_t port_ = kInitialPort;
 
  public:
@@ -352,7 +371,6 @@ class UDPClient : public TraceRouteClient {
     assert(std::holds_alternative<UDPPacket>(packet) &&
            "Expecting UDP packet.");
     auto &udp = std::get<UDPPacket>(packet);
-    data_ = udp.data;
     addr_.sin_port = htons(port_);
     port_++;
     if (sendto(send_fd_, reinterpret_cast<const void *>(&udp), sizeof(udp), 0,
@@ -382,23 +400,24 @@ class UDPClient : public TraceRouteClient {
       recv.identifier = ntohs(recv.identifier);
       recv.sequence_number = ntohs(recv.sequence_number);
       // TODO(wp): Handle replies other than ICMP echo
-      if (recv.type == ICMPPacket::kTimeExceed) {
+      if (recv.type == icmp::kTimeExceed) {
         UDPHeader header{};
-        UDPPacket orig{};
         memcpy(&header,
                buffer.data() + kIpHeaderSize + ICMPPacket::kPacketSize +
                    kIpHeaderSize,
                sizeof(header));
-        memcpy(&orig,
-               buffer.data() + kIpHeaderSize + ICMPPacket::kPacketSize +
-                   kIpHeaderSize + sizeof(header),
-               sizeof(orig));
-        std::cerr << "Exceed!\n";
-        return std::make_tuple(recv_addr, recv_time, true, false);
+        if (ntohs(header.destination_port) == port_ - 1) {
+          // Verify the returned UDP header by its destination port.
+          return std::make_tuple(recv_addr, recv_time, true, false);
+        }
       }
-      if (recv.type == ICMPPacket::kDestinationUnreachable) {
-        // destination reached but the port is unavailable.
-        return std::make_tuple(recv_addr, recv_time, false, false);
+      if (recv.type == icmp::kDestinationUnreachable) {
+        if (recv.code == icmp::kProtocolUnreachable ||
+            recv.code == icmp::kPortUnreachable) {
+          // Destination reached but the port is unavailable.
+          return std::make_tuple(recv_addr, recv_time, false, false);
+        }
+        // Network unreachable
       }
     }
   }
