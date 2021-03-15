@@ -161,6 +161,23 @@ class TraceRouteClient {
   struct sockaddr_in addr_ {};  // NOLINT
   int send_fd_{}, recv_fd_{};   // NOLINT
 
+  template <size_t BufferSize>
+  bool RecvICMPReply(std::array<uint8_t, BufferSize> &buffer, ICMPPacket &recv,
+                     struct sockaddr &recv_addr) const {
+    socklen_t recv_addr_len = sizeof(recv_addr);
+    auto recv_bytes = recvfrom(
+        recv_fd_, reinterpret_cast<void *>(buffer.data()), buffer.size(), 0,
+        reinterpret_cast<struct sockaddr *>(&recv_addr), &recv_addr_len);
+    if (recv_bytes == -1) {
+      if (errno == EAGAIN || errno == EWOULDBLOCK) return true;
+      PrintError("recvfrom");
+    }
+    memcpy(&recv, buffer.data() + kIpHeaderSize, sizeof(recv));
+    recv.identifier = ntohs(recv.identifier);
+    recv.sequence_number = ntohs(recv.sequence_number);
+    return false;
+  }
+
  public:
   TraceRouteClient() = default;
 
@@ -245,24 +262,14 @@ class TCPClient : public TraceRouteClient {
 
   [[nodiscard]] std::tuple<struct sockaddr, TimePoint, bool, bool> RecvReply()
       const override {
+    std::array<uint8_t, kIpHeaderSize + ICMPPacket::kPacketSize + 64> buffer{};
     while (true) {
-      std::array<char, kIpHeaderSize + ICMPPacket::kPacketSize + 64> buffer{};
       ICMPPacket recv{};
       struct sockaddr recv_addr {};
-      socklen_t recv_addr_len = sizeof(recv_addr);
-      auto recv_bytes = recvfrom(
-          recv_fd_, reinterpret_cast<void *>(buffer.data()), buffer.size(), 0,
-          reinterpret_cast<struct sockaddr *>(&recv_addr), &recv_addr_len);
+      bool timeout = RecvICMPReply(buffer, recv, recv_addr);
       auto recv_time = ClockType::now();
-      if (recv_bytes == -1) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK)
-          return std::make_tuple(sockaddr{}, recv_time, true, true);
-        PrintError("recvfrom");
-      }
-      // Extract ICMP content
-      memcpy(&recv, buffer.data() + kIpHeaderSize, sizeof(recv));
-      recv.identifier = ntohs(recv.identifier);
-      recv.sequence_number = ntohs(recv.sequence_number);
+      if (timeout) return std::make_tuple(sockaddr{}, recv_time, true, true);
+
       // TODO(wp): Handle replies other than ICMP echo
       if (recv.identifier == kIcmpIdentifier &&
           recv.sequence_number == kIcmpSeqNum) {
@@ -307,24 +314,14 @@ class ICMPClient : public TraceRouteClient {
 
   [[nodiscard]] std::tuple<struct sockaddr, TimePoint, bool, bool> RecvReply()
       const override {
+    std::array<uint8_t, kIpHeaderSize + ICMPPacket::kPacketSize + 64> buffer{};
     while (true) {
-      std::array<char, kIpHeaderSize + ICMPPacket::kPacketSize + 64> buffer{};
       ICMPPacket recv{};
       struct sockaddr recv_addr {};
-      socklen_t recv_addr_len = sizeof(recv_addr);
-      auto recv_bytes = recvfrom(
-          recv_fd_, reinterpret_cast<void *>(buffer.data()), buffer.size(), 0,
-          reinterpret_cast<struct sockaddr *>(&recv_addr), &recv_addr_len);
+      bool timeout = RecvICMPReply(buffer, recv, recv_addr);
       auto recv_time = ClockType::now();
-      if (recv_bytes == -1) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK)
-          return std::make_tuple(sockaddr{}, recv_time, true, true);
-        PrintError("recvfrom");
-      }
-      // Extract ICMP content
-      memcpy(&recv, buffer.data() + kIpHeaderSize, sizeof(recv));
-      recv.identifier = ntohs(recv.identifier);
-      recv.sequence_number = ntohs(recv.sequence_number);
+      if (timeout) return std::make_tuple(sockaddr{}, recv_time, true, true);
+
       // TODO(wp): Handle timeouts
       // TODO(wp): Handle replies other than ICMP echo
       if (recv.identifier == kIcmpIdentifier &&
@@ -381,24 +378,14 @@ class UDPClient : public TraceRouteClient {
 
   [[nodiscard]] std::tuple<struct sockaddr, TimePoint, bool, bool> RecvReply()
       const override {
+    std::array<uint8_t, kIpHeaderSize + ICMPPacket::kPacketSize + 64> buffer{};
     while (true) {
-      std::array<char, kIpHeaderSize + ICMPPacket::kPacketSize + 64> buffer{};
       ICMPPacket recv{};
       struct sockaddr recv_addr {};
-      socklen_t recv_addr_len = sizeof(recv_addr);
-      auto recv_bytes = recvfrom(
-          recv_fd_, reinterpret_cast<void *>(buffer.data()), buffer.size(), 0,
-          reinterpret_cast<struct sockaddr *>(&recv_addr), &recv_addr_len);
+      bool timeout = RecvICMPReply(buffer, recv, recv_addr);
       auto recv_time = ClockType::now();
-      if (recv_bytes == -1) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK)
-          return std::make_tuple(sockaddr{}, recv_time, true, true);
-        PrintError("recvfrom");
-      }
-      // Extract ICMP content
-      memcpy(&recv, buffer.data() + kIpHeaderSize, sizeof(recv));
-      recv.identifier = ntohs(recv.identifier);
-      recv.sequence_number = ntohs(recv.sequence_number);
+      if (timeout) return std::make_tuple(sockaddr{}, recv_time, true, true);
+
       // TODO(wp): Handle replies other than ICMP echo
       if (recv.type == icmp::kTimeExceed) {
         UDPHeader header{};
