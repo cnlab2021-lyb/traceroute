@@ -22,6 +22,7 @@ namespace {
 constexpr int kIpHeaderSize = 20;
 constexpr int kIcmpIdentifier = 0x7122, kIcmpSeqNum = 0x1234;
 constexpr int kTimeout = 10;
+constexpr uint16_t kInitialPort = 33435;
 
 in_addr LookUp(const char *domain) {
   hostent *host = gethostbyname(domain);
@@ -158,9 +159,9 @@ class TraceRouteClient {
   TraceRouteClient(char *host, int domain, int type, int protocol)
       : send_fd_(socket(domain, type, protocol)) {
     if (send_fd_ == -1) PrintError("socket");
-    addr_.sin_port = htons(7122);
     addr_.sin_family = AF_INET;
     addr_.sin_addr = LookUp(host);
+    addr_.sin_port = htons(7);
     recv_fd_ = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
   }
 
@@ -249,7 +250,7 @@ class ICMPClient : public TraceRouteClient {
           reinterpret_cast<struct sockaddr *>(&recv_addr), &recv_addr_len);
       auto recv_time = ClockType::now();
       if (recv_bytes == -1) {
-        if (errno == EAGAIN)
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
           return std::make_tuple(sockaddr{}, recv_time, true, true);
         PrintError("recvfrom");
       }
@@ -286,6 +287,7 @@ class ICMPClient : public TraceRouteClient {
 
 class UDPClient : public TraceRouteClient {
   uint32_t data_;
+  uint16_t port_ = kInitialPort;
 
  public:
   explicit UDPClient(char *host)
@@ -301,6 +303,8 @@ class UDPClient : public TraceRouteClient {
            "Expecting UDP packet.");
     auto &udp = std::get<UDPPacket>(packet);
     data_ = udp.data;
+    addr_.sin_port = htons(port_);
+    port_++;
     if (sendto(send_fd_, reinterpret_cast<const void *>(&udp), sizeof(udp), 0,
                reinterpret_cast<const struct sockaddr *>(&addr_),
                sizeof(addr_)) < 0)
@@ -319,7 +323,7 @@ class UDPClient : public TraceRouteClient {
           reinterpret_cast<struct sockaddr *>(&recv_addr), &recv_addr_len);
       auto recv_time = ClockType::now();
       if (recv_bytes == -1) {
-        if (errno == EAGAIN)
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
           return std::make_tuple(sockaddr{}, recv_time, true, true);
         PrintError("recvfrom");
       }
@@ -383,20 +387,21 @@ bool operator!=(const struct sockaddr &lhs, const struct sockaddr &rhs) {
 }
 
 class TraceRouteLogger {
-  int ttl_;
   struct sockaddr previous_ip_;
   bool first_record_;
 
  public:
-  explicit TraceRouteLogger(int ttl) : ttl_(ttl), first_record_(true) {}
+  explicit TraceRouteLogger(int ttl) : first_record_(true) {
+    std::cout << std::setw(2) << ttl << " ";
+    std::cout << std::flush;
+  }
   ~TraceRouteLogger() { std::cout << "\n"; }
 
   void Print(struct sockaddr ip, const TimePoint &send_time,
              const TimePoint &recv_time, bool timeout) {
     // First reply
-    if (first_record_) std::cout << std::setw(2) << ttl_ << "  ";
     if (ip != previous_ip_ && !timeout) {
-      if (!first_record_) std::cout << "\n    ";
+      if (!first_record_) std::cout << "\n   ";
       char hostname[30];
       getnameinfo(&ip, sizeof(ip), hostname, sizeof(hostname), nullptr, 0, 0);
       std::cout << hostname << " ("
