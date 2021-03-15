@@ -21,7 +21,7 @@ namespace {
 
 constexpr int kIpHeaderSize = 20;
 constexpr int kIcmpIdentifier = 0x7122, kIcmpSeqNum = 0x1234;
-constexpr int kTimeout = 10;
+constexpr int kTimeout = 2;
 constexpr uint16_t kInitialPort = 33435;
 
 in_addr LookUp(const char *domain) {
@@ -48,7 +48,7 @@ in_addr LookUp(const char *domain) {
 enum Mode { ICMP, TCP, UDP };
 
 struct Config {
-  Mode mode = ICMP;
+  Mode mode = UDP;
   int nqueries = 3;
   int first_ttl = 1;
   char *hostname;
@@ -67,9 +67,6 @@ struct Config {
 
 Config ParseArg(int argc, char *argv[]) {
   Config config{};
-
-  // traceroute by default use UDP
-  config.mode = UDP;
 
   // NOLINTNEXTLINE
   auto ParseInt = [&]() {
@@ -167,7 +164,7 @@ class TraceRouteClient {
 
   virtual ~TraceRouteClient() = default;
 
-  void InitSocket(int ttl) {
+  virtual void InitSocket(int ttl) {
     if (setsockopt(send_fd_, IPPROTO_IP, IP_TTL,
                    reinterpret_cast<const void *>(&ttl), sizeof(ttl)) < 0)
       PrintError("setsockopt(ttl)");
@@ -176,7 +173,7 @@ class TraceRouteClient {
     tv.tv_usec = 0;
     if (setsockopt(recv_fd_, SOL_SOCKET, SO_RCVTIMEO,
                    reinterpret_cast<const void *>(&tv), sizeof(tv)) < 0)
-      PrintError("setsockopt(sendtime)");
+      PrintError("setsockopt(rcvtime)");
   }
 
   virtual void SendRequest(Packet packet) = 0;
@@ -189,26 +186,79 @@ class TraceRouteClient {
   //
   // TODO(waynetu): Remove default implementation
   [[nodiscard]] virtual std::tuple<struct sockaddr, TimePoint, bool, bool>
-  RecvReply() const {}
+  RecvReply() const = 0;
 
   const char *GetAddress() const { return inet_ntoa(addr_.sin_addr); }
 };
 
 class TCPClient : public TraceRouteClient {
+  uint16_t port_ = kInitialPort;
+
  public:
   explicit TCPClient(char *host)
-      : TraceRouteClient(host, AF_INET, SOCK_STREAM, 0) {}
+      : TraceRouteClient(host, AF_INET, SOCK_STREAM, IPPROTO_TCP) {}
 
   ~TCPClient() override {
     close(send_fd_);
     close(recv_fd_);
   }
 
+  void InitSocket(int ttl) override {
+    close(send_fd_);
+    send_fd_ = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (setsockopt(send_fd_, IPPROTO_IP, IP_TTL,
+                   reinterpret_cast<const void *>(&ttl), sizeof(ttl)) < 0)
+      PrintError("setsockopt(ttl)");
+    struct timeval tv;
+    tv.tv_sec = kTimeout;
+    tv.tv_usec = 0;
+    if (setsockopt(recv_fd_, SOL_SOCKET, SO_RCVTIMEO,
+                   reinterpret_cast<const void *>(&tv), sizeof(tv)) < 0)
+      PrintError("setsockopt(rcvtime)");
+  }
+
   void SendRequest(Packet packet) override {
     assert(std::holds_alternative<TCPPacket>(packet) &&
            "Expecting TCP packet.");
+    addr_.sin_port = htons(port_);
+    port_++;
     connect(send_fd_, reinterpret_cast<const struct sockaddr *>(&addr_),
             sizeof(addr_));
+  }
+
+  [[nodiscard]] std::tuple<struct sockaddr, TimePoint, bool, bool> RecvReply()
+      const override {
+    while (true) {
+      std::array<char, kIpHeaderSize + ICMPPacket::kPacketSize + 64> buffer{};
+      ICMPPacket recv{};
+      struct sockaddr recv_addr {};
+      socklen_t recv_addr_len = sizeof(recv_addr);
+      auto recv_bytes = recvfrom(
+          recv_fd_, reinterpret_cast<void *>(buffer.data()), buffer.size(), 0,
+          reinterpret_cast<struct sockaddr *>(&recv_addr), &recv_addr_len);
+      auto recv_time = ClockType::now();
+      if (recv_bytes == -1) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+          return std::make_tuple(sockaddr{}, recv_time, true, true);
+        PrintError("recvfrom");
+      }
+      // Extract ICMP content
+      memcpy(&recv, buffer.data() + kIpHeaderSize, sizeof(recv));
+      recv.identifier = ntohs(recv.identifier);
+      recv.sequence_number = ntohs(recv.sequence_number);
+      // TODO(wp): Handle replies other than ICMP echo
+      if (recv.identifier == kIcmpIdentifier &&
+          recv.sequence_number == kIcmpSeqNum) {
+        if (recv.type == ICMPPacket::kEchoReply) {
+          std::cerr << "GET!\n";
+          return std::make_tuple(recv_addr, recv_time, false, false);
+        }
+      }
+      if (recv.type == ICMPPacket::kTimeExceed) {
+        // TODO: Validate returned TCP packets.
+        return std::make_tuple(recv_addr, recv_time, true, false);
+      }
+    }
   }
 };
 
@@ -364,6 +414,8 @@ Packet BuildPacket(Mode mode) {
       return UDPPacket{rng()};
     }
     case ICMP:
+      // TODO(waynetu): properly set up identifer and sequence number for ICMP
+      // packets.
       return ICMPPacket(kIcmpIdentifier, kIcmpSeqNum);
   }
   __builtin_unreachable();
@@ -441,7 +493,6 @@ int main(int argc, char *argv[]) {
     TraceRouteLogger logger(hop);
     // XXX(waynetu): (Improvement) Send all requests before receiving replies.
     for (int query = 0; query < config.nqueries; ++query) {
-      // TODO(waynetu): properly set up identifer and sequence number
       client->InitSocket(hop);
       auto send_time = ClockType::now();
       auto packet = BuildPacket(config.mode);
