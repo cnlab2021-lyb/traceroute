@@ -56,7 +56,7 @@ struct Config {
 
 [[noreturn]] void PrintUsage() {
   std::cerr << "Usage:\n";
-  std::cerr << "  traceroute [ -f first_ttl ] [ -q nqueries ] [ -t/-u ] host\n";
+  std::cerr << "  traceroute [ -IT ] [ -f first_ttl ] [ -q nqueries ] host\n";
   exit(1);
 }
 
@@ -66,8 +66,10 @@ struct Config {
 }
 
 Config ParseArg(int argc, char *argv[]) {
-  bool tcp = false, udp = false;
   Config config{};
+
+  // traceroute by default use UDP
+  config.mode = UDP;
 
   // NOLINTNEXTLINE
   auto ParseInt = [&]() {
@@ -79,18 +81,16 @@ Config ParseArg(int argc, char *argv[]) {
     }
   };
 
-  for (int opt = getopt(argc, argv, "fqtu"); opt != -1;
-       opt = getopt(argc, argv, "fqtu")) {
-    if (opt == 't') tcp = true;
-    if (opt == 'u') udp = true;
+  for (int opt = getopt(argc, argv, "fqIT"); opt != -1;
+       opt = getopt(argc, argv, "fqIT")) {
+    if (opt == 'I') config.mode = ICMP;
+    if (opt == 'T') config.mode = TCP;
 
     if (opt == 'f') config.first_ttl = ParseInt();
     if (opt == 'q') config.nqueries = ParseInt();
   }
 
-  if ((tcp && udp) || optind != argc - 1) PrintUsage();
-
-  config.mode = (tcp ? TCP : (udp ? UDP : ICMP));
+  if (optind != argc - 1) PrintUsage();
   config.hostname = argv[optind];
   return config;
 }
