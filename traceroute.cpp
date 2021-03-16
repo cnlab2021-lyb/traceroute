@@ -1,4 +1,5 @@
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -7,6 +8,7 @@
 #include <array>
 #include <cassert>
 #include <chrono>
+#include <climits>
 #include <cstring>
 #include <iomanip>
 #include <iostream>
@@ -149,6 +151,12 @@ struct alignas(2) ICMPPacket {
     auto low = static_cast<uint32_t>(sum & ((1U << 16) - 1));
     checksum = htons(static_cast<uint16_t>(~(high + low)));
   }
+
+  // Needs to be called if the object is directly built from bytes w/ memcpy
+  void Normalize() {
+    identifier = ntohs(identifier);
+    sequence_number = ntohs(sequence_number);
+  }
 };
 
 struct TCPHeader {
@@ -255,11 +263,14 @@ class TraceRouteClient {
 };
 
 class TCPClient : public TraceRouteClient {
-  uint16_t port_ = kInitialPort;
+  // XXX(wp): Fails with some routers if port is not 80
+  uint16_t port_ = 80;
+  int last_ret_ = INT_MIN;
+  int fd_args_ = 0;
 
  public:
   explicit TCPClient(char *host)
-      : TraceRouteClient(host, AF_INET, SOCK_STREAM, IPPROTO_TCP) {}
+      : TraceRouteClient(host, AF_INET, SOCK_RAW, IPPROTO_ICMP) {}
 
   ~TCPClient() override {
     close(send_fd_);
@@ -268,10 +279,29 @@ class TCPClient : public TraceRouteClient {
 
   void InitSocket(int ttl, double time_limit) override {
     close(send_fd_);
-    send_fd_ = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    send_fd_ = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
+    struct sockaddr bind_addr {};
+    bind_addr.sa_family = AF_INET;
+    if (bind(send_fd_, &bind_addr, sizeof(bind_addr)) < 0)
+      PrintError("bind");
     if (setsockopt(send_fd_, IPPROTO_IP, IP_TTL,
                    reinterpret_cast<const void *>(&ttl), sizeof(ttl)) < 0)
       PrintError("setsockopt(ttl)");
+    int mtu_discover = IP_PMTUDISC_DONT;
+    if (setsockopt(send_fd_, IPPROTO_IP, IP_MTU_DISCOVER,
+                   reinterpret_cast<const void *>(&mtu_discover),
+                   sizeof(mtu_discover)) < 0)
+      PrintError("setsockopt(mtu)");
+    int recvttl = 1;
+    if (setsockopt(send_fd_, IPPROTO_IP, IP_RECVTTL,
+                   reinterpret_cast<const void *>(&recvttl),
+                   sizeof(recvttl)) < 0)
+      PrintError("setsockopt(recvttl)");
+    int so_timestamp = 1;
+    if (setsockopt(send_fd_, SOL_SOCKET, SO_TIMESTAMP_OLD,
+                   reinterpret_cast<const void *>(&so_timestamp),
+                   sizeof(so_timestamp)) < 0)
+      PrintError("setsockopt(recvttl)");
     struct timeval tv;
     tv.tv_sec = static_cast<int>(time_limit);
     tv.tv_usec = static_cast<int>((time_limit - static_cast<int>(time_limit)) *
@@ -279,44 +309,67 @@ class TCPClient : public TraceRouteClient {
     if (setsockopt(recv_fd_, SOL_SOCKET, SO_RCVTIMEO,
                    reinterpret_cast<const void *>(&tv), sizeof(tv)) < 0)
       PrintError("setsockopt(rcvtime)");
+    fd_args_ = fcntl(send_fd_, F_GETFL, NULL);
+    if (fcntl(send_fd_, F_SETFL, fd_args_ | O_NONBLOCK) < 0) {
+      PrintError("fnctl");
+    }
   }
 
   void SendRequest(Packet packet) override {
     assert(std::holds_alternative<TCPPacket>(packet) &&
            "Expecting TCP packet.");
     addr_.sin_port = htons(port_);
-    port_++;
-    connect(send_fd_, reinterpret_cast<const struct sockaddr *>(&addr_),
-            sizeof(addr_));
+    last_ret_ =
+        connect(send_fd_, reinterpret_cast<const struct sockaddr *>(&addr_),
+                sizeof(addr_));
+    if (last_ret_ != 0) {
+      if (errno == EHOSTUNREACH) {
+        last_ret_ = EHOSTUNREACH;
+      } else if (errno == EINPROGRESS) {
+        last_ret_ = EINPROGRESS;
+      } else {
+        PrintError("connect");
+      }
+    }
   }
 
   [[nodiscard]] std::tuple<struct sockaddr, TimePoint, ICMPStatus> RecvReply()
       const override {
+    assert(last_ret_ != INT_MIN);
     std::array<uint8_t, kIpHeaderSize + ICMPPacket::kPacketSize + 64> buffer{};
+    int last_ret{last_ret_};
     while (true) {
-      ICMPPacket recv{};
-      struct sockaddr recv_addr {};
-      bool timeout = RecvICMPReply(buffer, recv, recv_addr);
-      auto recv_time = ClockType::now();
-      if (timeout) return std::make_tuple(sockaddr{}, recv_time, TIMEOUT);
-
-      // TODO(wp): Handle replies other than ICMP echo
-      if (recv.identifier == kIcmpIdentifier &&
-          recv.sequence_number == kIcmpSeqNum) {
-        if (recv.type == icmp::kEchoReply) {
-          return std::make_tuple(recv_addr, recv_time, DESTINATION_REACHED);
+      if (last_ret == 0 || last_ret == ECONNREFUSED) {
+        struct sockaddr recv_addr {};
+        memcpy(&recv_addr, &addr_, sizeof(recv_addr));
+        return std::make_tuple(recv_addr, ClockType::now(),
+                               DESTINATION_REACHED);
+      }
+      if (last_ret == EINPROGRESS || last_ret == EALREADY) {
+        last_ret =
+            connect(send_fd_, reinterpret_cast<const struct sockaddr *>(&addr_),
+                    sizeof(addr_));
+        if (last_ret < 0) {
+          last_ret = errno;
         }
-      }
-      if (recv.type == icmp::kTimeExceed) {
-        // TODO: Validate returned TCP packets.
-        return std::make_tuple(recv_addr, recv_time, TTL_EXPIRED);
-      }
-      if (recv.type == icmp::kDestinationUnreachable) {
-        constexpr std::array<ICMPStatus, 4> kUnreachableLookUpTable = {
-            NETWORK_UNREACHABLE, HOST_UNREACHABLE, PROTOCOL_UNREACHABLE,
-            DESTINATION_REACHED};
-        return std::make_tuple(recv_addr, recv_time,
-                               kUnreachableLookUpTable.at(recv.type));
+      } else {
+        ICMPPacket recv{};
+        struct sockaddr recv_addr {};
+        bool timeout = RecvICMPReply(buffer, recv, recv_addr);
+        auto recv_time = ClockType::now();
+        if (timeout) return std::make_tuple(sockaddr{}, recv_time, TIMEOUT);
+
+        if (recv.type == icmp::kTimeExceed) {
+          // TODO: Validate returned TCP packets.
+          return std::make_tuple(recv_addr, recv_time, TTL_EXPIRED);
+        }
+        if (recv.type == icmp::kDestinationUnreachable) {
+          constexpr std::array<ICMPStatus, 4> kUnreachableLookUpTable = {
+              NETWORK_UNREACHABLE, HOST_UNREACHABLE, PROTOCOL_UNREACHABLE,
+              DESTINATION_REACHED};
+          return std::make_tuple(recv_addr, recv_time,
+                                 kUnreachableLookUpTable.at(recv.type));
+        }
       }
     }
   }
@@ -358,7 +411,7 @@ class ICMPClient : public TraceRouteClient {
       auto recv_time = ClockType::now();
       if (timeout) return std::make_tuple(sockaddr{}, recv_time, TIMEOUT);
 
-      // TODO(wp): Handle replies other than ICMP echo
+      // TODO(wp): Handle timeouts
       if (recv.identifier == kIcmpIdentifier &&
           recv.sequence_number == kIcmpSeqNum) {
         if (recv.type == icmp::kEchoReply) {
@@ -426,7 +479,6 @@ class UDPClient : public TraceRouteClient {
       auto recv_time = ClockType::now();
       if (timeout) return std::make_tuple(sockaddr{}, recv_time, TIMEOUT);
 
-      // TODO(wp): Handle replies other than ICMP echo
       if (recv.type == icmp::kTimeExceed) {
         UDPHeader header{};
         memcpy(&header,
