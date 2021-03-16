@@ -424,7 +424,7 @@ Packet BuildPacket(Mode mode) {
     case UDP: {
       std::mt19937 rng(
           std::chrono::high_resolution_clock::now().time_since_epoch().count());
-      return UDPPacket{rng()};
+      return UDPPacket{static_cast<uint32_t>(rng())};
     }
     case ICMP:
       // TODO(waynetu): properly set up identifer and sequence number for ICMP
