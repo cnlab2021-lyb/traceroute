@@ -156,6 +156,15 @@ using Packet = std::variant<ICMPPacket, TCPPacket, UDPPacket>;
 using ClockType = std::chrono::steady_clock;
 using TimePoint = std::chrono::time_point<ClockType>;
 
+enum ICMPStatus : uint8_t {
+  DESTINATION_REACHED,
+  TIMEOUT,
+  TTL_EXPIRED,
+  HOST_UNREACHABLE,
+  NETWORK_UNREACHABLE,
+  PROTOCOL_UNREACHABLE,
+};
+
 class TraceRouteClient {
  protected:
   struct sockaddr_in addr_ {};  // NOLINT
@@ -215,11 +224,10 @@ class TraceRouteClient {
   /// Return a tuple consisting of
   /// - Source IP address
   /// - Time when the packet is received
-  /// - Whether the ICMP packet is of type Time Exceeded
-  /// - Whether the reply has timed out
+  /// - The returned status
   //
   // TODO(waynetu): Remove default implementation
-  [[nodiscard]] virtual std::tuple<struct sockaddr, TimePoint, bool, bool>
+  [[nodiscard]] virtual std::tuple<struct sockaddr, TimePoint, ICMPStatus>
   RecvReply() const = 0;
 
   const char *GetAddress() const { return inet_ntoa(addr_.sin_addr); }
@@ -260,7 +268,7 @@ class TCPClient : public TraceRouteClient {
             sizeof(addr_));
   }
 
-  [[nodiscard]] std::tuple<struct sockaddr, TimePoint, bool, bool> RecvReply()
+  [[nodiscard]] std::tuple<struct sockaddr, TimePoint, ICMPStatus> RecvReply()
       const override {
     std::array<uint8_t, kIpHeaderSize + ICMPPacket::kPacketSize + 64> buffer{};
     while (true) {
@@ -268,19 +276,19 @@ class TCPClient : public TraceRouteClient {
       struct sockaddr recv_addr {};
       bool timeout = RecvICMPReply(buffer, recv, recv_addr);
       auto recv_time = ClockType::now();
-      if (timeout) return std::make_tuple(sockaddr{}, recv_time, true, true);
+      if (timeout) return std::make_tuple(sockaddr{}, recv_time, TIMEOUT);
 
       // TODO(wp): Handle replies other than ICMP echo
       if (recv.identifier == kIcmpIdentifier &&
           recv.sequence_number == kIcmpSeqNum) {
         if (recv.type == icmp::kEchoReply) {
           std::cerr << "GET!\n";
-          return std::make_tuple(recv_addr, recv_time, false, false);
+          return std::make_tuple(recv_addr, recv_time, DESTINATION_REACHED);
         }
       }
       if (recv.type == icmp::kTimeExceed) {
         // TODO: Validate returned TCP packets.
-        return std::make_tuple(recv_addr, recv_time, true, false);
+        return std::make_tuple(recv_addr, recv_time, TTL_EXPIRED);
       }
     }
   }
@@ -312,7 +320,7 @@ class ICMPClient : public TraceRouteClient {
       PrintError("sendto");
   }
 
-  [[nodiscard]] std::tuple<struct sockaddr, TimePoint, bool, bool> RecvReply()
+  [[nodiscard]] std::tuple<struct sockaddr, TimePoint, ICMPStatus> RecvReply()
       const override {
     std::array<uint8_t, kIpHeaderSize + ICMPPacket::kPacketSize + 64> buffer{};
     while (true) {
@@ -320,7 +328,7 @@ class ICMPClient : public TraceRouteClient {
       struct sockaddr recv_addr {};
       bool timeout = RecvICMPReply(buffer, recv, recv_addr);
       auto recv_time = ClockType::now();
-      if (timeout) return std::make_tuple(sockaddr{}, recv_time, true, true);
+      if (timeout) return std::make_tuple(sockaddr{}, recv_time, TIMEOUT);
 
       // TODO(wp): Handle timeouts
       // TODO(wp): Handle replies other than ICMP echo
@@ -328,7 +336,7 @@ class ICMPClient : public TraceRouteClient {
           recv.sequence_number == kIcmpSeqNum) {
         if (recv.type == icmp::kEchoReply) {
           std::cerr << "GET!\n";
-          return std::make_tuple(recv_addr, recv_time, false, false);
+          return std::make_tuple(recv_addr, recv_time, DESTINATION_REACHED);
         }
       }
       if (recv.type == icmp::kTimeExceed) {
@@ -345,7 +353,7 @@ class ICMPClient : public TraceRouteClient {
         if (orig.identifier == kIcmpIdentifier &&
             orig.sequence_number == kIcmpSeqNum) {
           std::cerr << "Exceed!\n";
-          return std::make_tuple(recv_addr, recv_time, true, false);
+          return std::make_tuple(recv_addr, recv_time, TTL_EXPIRED);
         }
       }
     }
@@ -376,7 +384,7 @@ class UDPClient : public TraceRouteClient {
       PrintError("sendto");
   }
 
-  [[nodiscard]] std::tuple<struct sockaddr, TimePoint, bool, bool> RecvReply()
+  [[nodiscard]] std::tuple<struct sockaddr, TimePoint, ICMPStatus> RecvReply()
       const override {
     std::array<uint8_t, kIpHeaderSize + ICMPPacket::kPacketSize + 64> buffer{};
     while (true) {
@@ -384,7 +392,7 @@ class UDPClient : public TraceRouteClient {
       struct sockaddr recv_addr {};
       bool timeout = RecvICMPReply(buffer, recv, recv_addr);
       auto recv_time = ClockType::now();
-      if (timeout) return std::make_tuple(sockaddr{}, recv_time, true, true);
+      if (timeout) return std::make_tuple(sockaddr{}, recv_time, TIMEOUT);
 
       // TODO(wp): Handle replies other than ICMP echo
       if (recv.type == icmp::kTimeExceed) {
@@ -395,16 +403,15 @@ class UDPClient : public TraceRouteClient {
                sizeof(header));
         if (ntohs(header.destination_port) == port_ - 1) {
           // Verify the returned UDP header by its destination port.
-          return std::make_tuple(recv_addr, recv_time, true, false);
+          return std::make_tuple(recv_addr, recv_time, TTL_EXPIRED);
         }
       }
       if (recv.type == icmp::kDestinationUnreachable) {
-        if (recv.code == icmp::kProtocolUnreachable ||
-            recv.code == icmp::kPortUnreachable) {
-          // Destination reached but the port is unavailable.
-          return std::make_tuple(recv_addr, recv_time, false, false);
-        }
-        // Network unreachable
+        constexpr std::array<ICMPStatus, 4> kUnreachableLookUpTable = {
+            NETWORK_UNREACHABLE, HOST_UNREACHABLE, PROTOCOL_UNREACHABLE,
+            DESTINATION_REACHED};
+        return std::make_tuple(recv_addr, recv_time,
+                               kUnreachableLookUpTable.at(recv.type));
       }
     }
   }
@@ -456,9 +463,9 @@ class TraceRouteLogger {
   ~TraceRouteLogger() { std::cout << "\n"; }
 
   void Print(struct sockaddr ip, const TimePoint &send_time,
-             const TimePoint &recv_time, bool timeout) {
+             const TimePoint &recv_time, ICMPStatus status) {
     // First reply
-    if (ip != previous_ip_ && !timeout) {
+    if (ip != previous_ip_ && status != TIMEOUT) {
       if (!first_record_) std::cout << "\n   ";
       char hostname[30];
       getnameinfo(&ip, sizeof(ip), hostname, sizeof(hostname), nullptr, 0, 0);
@@ -467,8 +474,14 @@ class TraceRouteLogger {
                 << ")";
     }
     std::cout << "  ";
-    if (timeout) {
+    if (status == TIMEOUT) {
       std::cout << "*";
+    } else if (status == HOST_UNREACHABLE) {
+      std::cout << "!H";
+    } else if (status == NETWORK_UNREACHABLE) {
+      std::cout << "!N";
+    } else if (status == PROTOCOL_UNREACHABLE) {
+      std::cout << "!P";
     } else {
       auto time_elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
                               recv_time - send_time)
@@ -492,7 +505,8 @@ int main(int argc, char *argv[]) {
   constexpr int kMaxHop = 64;
   std::unique_ptr<TraceRouteClient> client = BuildClient(config);
   std::cout << "traceroute to " << config.hostname << " ("
-            << client->GetAddress() << "), " << kMaxHop << " hops max\n";
+            << client->GetAddress() << "), " << kMaxHop << " hops max"
+            << std::endl;
 
   for (int hop = config.first_ttl; hop <= kMaxHop; ++hop) {
     bool is_exceed = true;
@@ -503,9 +517,9 @@ int main(int argc, char *argv[]) {
       auto send_time = ClockType::now();
       auto packet = BuildPacket(config.mode);
       client->SendRequest(packet);
-      auto [source_ip, recv_time, ex, timeout] = client->RecvReply();
-      is_exceed &= ex;
-      logger.Print(source_ip, send_time, recv_time, timeout);
+      auto [source_ip, recv_time, status] = client->RecvReply();
+      is_exceed &= (status != DESTINATION_REACHED);
+      logger.Print(source_ip, send_time, recv_time, status);
     }
 
     // Destination reached
