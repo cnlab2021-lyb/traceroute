@@ -8,7 +8,6 @@
 #include <cassert>
 #include <chrono>
 #include <cstring>
-#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <memory>
@@ -51,12 +50,14 @@ struct Config {
   Mode mode = UDP;
   int nqueries = 3;
   int first_ttl = 1;
+  int max_ttl = 64;
   char *hostname;
 };
 
 [[noreturn]] void PrintUsage() {
   std::cerr << "Usage:\n";
-  std::cerr << "  traceroute [ -IT ] [ -f first_ttl ] [ -q nqueries ] host\n";
+  std::cerr << "  traceroute [ -IT ] [ -f first_ttl ] [ -q nqueries ] [ -m "
+               "max_ttl ] host\n";
   exit(1);
 }
 
@@ -78,12 +79,13 @@ Config ParseArg(int argc, char *argv[]) {
     }
   };
 
-  for (int opt = getopt(argc, argv, "fqIT"); opt != -1;
-       opt = getopt(argc, argv, "fqIT")) {
+  for (int opt = getopt(argc, argv, "fmqIT"); opt != -1;
+       opt = getopt(argc, argv, "fmqIT")) {
     if (opt == 'I') config.mode = ICMP;
     if (opt == 'T') config.mode = TCP;
 
     if (opt == 'f') config.first_ttl = ParseInt();
+    if (opt == 'm') config.max_ttl = ParseInt();
     if (opt == 'q') config.nqueries = ParseInt();
   }
 
@@ -138,7 +140,16 @@ struct alignas(2) ICMPPacket {
   }
 };
 
-// TODO(waynetu): Implement TCP and UDP packets.
+struct TCPHeader {
+  uint16_t source_port;
+  uint16_t destination_port;
+  uint32_t sequence_number;
+  uint32_t ack;
+  uint32_t unused;
+  uint16_t checksum;
+  uint16_t urgent_pointer;
+};
+
 struct TCPPacket {};
 
 struct UDPHeader {
@@ -290,6 +301,13 @@ class TCPClient : public TraceRouteClient {
         // TODO: Validate returned TCP packets.
         return std::make_tuple(recv_addr, recv_time, TTL_EXPIRED);
       }
+      if (recv.type == icmp::kDestinationUnreachable) {
+        constexpr std::array<ICMPStatus, 4> kUnreachableLookUpTable = {
+            NETWORK_UNREACHABLE, HOST_UNREACHABLE, PROTOCOL_UNREACHABLE,
+            DESTINATION_REACHED};
+        return std::make_tuple(recv_addr, recv_time,
+                               kUnreachableLookUpTable.at(recv.type));
+      }
     }
   }
 };
@@ -330,7 +348,6 @@ class ICMPClient : public TraceRouteClient {
       auto recv_time = ClockType::now();
       if (timeout) return std::make_tuple(sockaddr{}, recv_time, TIMEOUT);
 
-      // TODO(wp): Handle timeouts
       // TODO(wp): Handle replies other than ICMP echo
       if (recv.identifier == kIcmpIdentifier &&
           recv.sequence_number == kIcmpSeqNum) {
@@ -502,13 +519,12 @@ int main(int argc, char *argv[]) {
                 "Padding is not allowed.");
   auto config = ParseArg(argc, argv);
 
-  constexpr int kMaxHop = 64;
   std::unique_ptr<TraceRouteClient> client = BuildClient(config);
   std::cout << "traceroute to " << config.hostname << " ("
-            << client->GetAddress() << "), " << kMaxHop << " hops max"
+            << client->GetAddress() << "), " << config.max_ttl << " hops max"
             << std::endl;
 
-  for (int hop = config.first_ttl; hop <= kMaxHop; ++hop) {
+  for (int hop = config.first_ttl; hop <= config.max_ttl; ++hop) {
     bool is_exceed = true;
     TraceRouteLogger logger(hop);
     // XXX(waynetu): (Improvement) Send all requests before receiving replies.
