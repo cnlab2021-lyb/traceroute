@@ -516,7 +516,7 @@ class TraceRouteLogger {
     // First reply
     if (ip != previous_ip_ && status != TIMEOUT) {
       if (!first_record_) std::cout << "\n   ";
-      char hostname[30];
+      char hostname[1024];
       getnameinfo(&ip, sizeof(ip), hostname, sizeof(hostname), nullptr, 0, 0);
       std::cout << hostname << " ("
                 << inet_ntoa(reinterpret_cast<sockaddr_in *>(&ip)->sin_addr)
