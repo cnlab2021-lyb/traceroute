@@ -469,7 +469,7 @@ bool operator!=(const struct sockaddr &lhs, const struct sockaddr &rhs) {
 }
 
 class TraceRouteLogger {
-  struct sockaddr previous_ip_;
+  struct sockaddr previous_ip_ {};
   bool first_record_;
 
  public:

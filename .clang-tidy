@@ -14,3 +14,5 @@ CheckOptions:
     value:           CamelCase
   - key:             readability-identifier-naming.ConstexprVariablePrefix
     value:           k
+  - key:             readability-identifier-naming.PrivateMemberSuffix
+    value:           _
