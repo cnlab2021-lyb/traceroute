@@ -522,20 +522,19 @@ class TraceRouteLogger {
                 << inet_ntoa(reinterpret_cast<sockaddr_in *>(&ip)->sin_addr)
                 << ")";
     }
-    std::cout << "  ";
     if (status == TIMEOUT) {
-      std::cout << "*";
+      std::cout << " *";
     } else if (status == HOST_UNREACHABLE) {
-      std::cout << "!H";
+      std::cout << " !H";
     } else if (status == NETWORK_UNREACHABLE) {
-      std::cout << "!N";
+      std::cout << " !N";
     } else if (status == PROTOCOL_UNREACHABLE) {
-      std::cout << "!P";
+      std::cout << " !P";
     } else {
       auto time_elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
                               recv_time - send_time)
                               .count();
-      std::cout << std::fixed << std::setprecision(3)
+      std::cout << std::fixed << std::setprecision(3) << "  "
                 << static_cast<double>(time_elapsed) / 1000 << " ms";
       previous_ip_ = ip;
     }
