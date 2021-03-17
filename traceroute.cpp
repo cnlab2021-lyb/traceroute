@@ -287,22 +287,7 @@ class TCPClient : public TraceRouteClient {
     if (setsockopt(send_fd_, IPPROTO_IP, IP_TTL,
                    reinterpret_cast<const void *>(&ttl), sizeof(ttl)) < 0)
       PrintError("setsockopt(ttl)");
-    int mtu_discover = IP_PMTUDISC_DONT;
-    if (setsockopt(send_fd_, IPPROTO_IP, IP_MTU_DISCOVER,
-                   reinterpret_cast<const void *>(&mtu_discover),
-                   sizeof(mtu_discover)) < 0)
-      PrintError("setsockopt(mtu)");
-    int recvttl = 1;
-    if (setsockopt(send_fd_, IPPROTO_IP, IP_RECVTTL,
-                   reinterpret_cast<const void *>(&recvttl),
-                   sizeof(recvttl)) < 0)
-      PrintError("setsockopt(recvttl)");
-    int so_timestamp = 1;
-    if (setsockopt(send_fd_, SOL_SOCKET, SO_TIMESTAMP_OLD,
-                   reinterpret_cast<const void *>(&so_timestamp),
-                   sizeof(so_timestamp)) < 0)
-      PrintError("setsockopt(recvttl)");
-    struct timeval tv;
+    struct timeval tv{};
     tv.tv_sec = static_cast<int>(time_limit);
     tv.tv_usec = static_cast<int>((time_limit - static_cast<int>(time_limit)) *
                                   1'000'000);
