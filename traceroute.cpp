@@ -92,7 +92,11 @@ Config ParseArg(int argc, char *argv[]) {
     if (opt == 'q') config.nqueries = ParseInt();
 
     if (opt == 'w') {
-      // TODO: Parse option -w
+      if (optind == argc) PrintUsage();
+      // XXX(waynetu): This is so ugly.
+      sscanf(argv[optind++], "%lf,%d,%d", &config.max_wait_time,
+             &config.here_wait_time_multiplier,
+             &config.near_wait_time_multiplier);
     }
   }
 
