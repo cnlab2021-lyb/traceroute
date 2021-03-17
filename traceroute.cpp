@@ -248,8 +248,6 @@ class TraceRouteClient {
   /// - Source IP address
   /// - Time when the packet is received
   /// - The returned status
-  //
-  // TODO(waynetu): Remove default implementation
   [[nodiscard]] virtual std::tuple<struct sockaddr, TimePoint, ICMPStatus>
   RecvReply() const = 0;
 
@@ -382,6 +380,13 @@ class ICMPClient : public TraceRouteClient {
             orig.sequence_number == kIcmpSeqNum) {
           return std::make_tuple(recv_addr, recv_time, TTL_EXPIRED);
         }
+      }
+      if (recv.type == icmp::kDestinationUnreachable) {
+        constexpr std::array<ICMPStatus, 4> kUnreachableLookUpTable = {
+            NETWORK_UNREACHABLE, HOST_UNREACHABLE, PROTOCOL_UNREACHABLE,
+            DESTINATION_REACHED};
+        return std::make_tuple(recv_addr, recv_time,
+                               kUnreachableLookUpTable.at(recv.type));
       }
     }
   }
