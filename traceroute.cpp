@@ -30,11 +30,11 @@ in_addr LookUp(const char *domain) {
     exit(1);
   }
   auto **addr_list = reinterpret_cast<in_addr **>(host->h_addr_list);
-  int num_ip = 0;
   if (!addr_list || !addr_list[0]) {
     std::cerr << "traceroute: unknown host " << domain << "\n";
     exit(1);
   }
+  int num_ip = 0;
   while (addr_list[num_ip]) num_ip++;
   if (num_ip > 1) {
     std::cerr << "traceroute: Warning: " << domain
@@ -233,7 +233,7 @@ class TraceRouteClient {
     if (setsockopt(send_fd_, IPPROTO_IP, IP_TTL,
                    reinterpret_cast<const void *>(&ttl), sizeof(ttl)) < 0)
       PrintError("setsockopt(ttl)");
-    struct timeval tv;
+    struct timeval tv {};
     tv.tv_sec = static_cast<int>(time_limit);
     tv.tv_usec = static_cast<int>((time_limit - static_cast<int>(time_limit)) *
                                   1'000'000);
