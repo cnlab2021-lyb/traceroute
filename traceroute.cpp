@@ -357,6 +357,21 @@ class TCPClient : public TraceRouteClient {
         auto recv_time = ClockType::now();
         if (timeout) return std::make_tuple(sockaddr{}, recv_time, TIMEOUT);
 
+        struct sockaddr_in send_addr {};
+        socklen_t len = sizeof(send_addr);
+        if (getsockname(send_fd_,
+                        reinterpret_cast<struct sockaddr *>(&send_addr),
+                        &len) < 0) {
+          PrintError("getsockname");
+        }
+
+        uint16_t port = ntohs(send_addr.sin_port);
+        TCPHeader header{};
+        memcpy(&header,
+               buffer.data() + kIpHeaderSize + ICMPPacket::kPacketSize +
+                   kIpHeaderSize,
+               sizeof(header));
+        if (ntohs(header.source_port) != port) continue;
         if (recv.type == icmp::kTimeExceed) {
           // TODO: Validate returned TCP packets.
           return std::make_tuple(recv_addr, recv_time, TTL_EXPIRED);
