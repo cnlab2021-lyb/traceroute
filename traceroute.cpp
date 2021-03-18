@@ -265,6 +265,8 @@ class TCPClient : public TraceRouteClient {
   uint16_t port_ = 80;
   int last_ret_ = INT_MIN;
   int fd_args_ = 0;
+  TimePoint send_time_{};
+  long time_limit_us_{};
 
  public:
   explicit TCPClient(char *host)
@@ -276,6 +278,7 @@ class TCPClient : public TraceRouteClient {
   }
 
   void InitSocket(int ttl, double time_limit) override {
+    time_limit_us_ = static_cast<long>(time_limit * 1'000'000);
     close(send_fd_);
     send_fd_ = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
     struct sockaddr bind_addr {};
@@ -321,11 +324,12 @@ class TCPClient : public TraceRouteClient {
     last_ret_ =
         connect(send_fd_, reinterpret_cast<const struct sockaddr *>(&addr_),
                 sizeof(addr_));
+    send_time_ = ClockType::now();
     if (last_ret_ != 0) {
       if (errno == EHOSTUNREACH) {
         last_ret_ = EHOSTUNREACH;
       } else if (errno == EINPROGRESS) {
-        last_ret_ = EINPROGRESS;
+        last_ret_ = EALREADY;
       } else {
         PrintError("connect");
       }
@@ -338,13 +342,22 @@ class TCPClient : public TraceRouteClient {
     std::array<uint8_t, kIpHeaderSize + ICMPPacket::kPacketSize + 64> buffer{};
     int last_ret{last_ret_};
     while (true) {
+      // TODO(wp): poll/select instead of busy wait.
       if (last_ret == 0 || last_ret == ECONNREFUSED) {
         struct sockaddr recv_addr {};
         memcpy(&recv_addr, &addr_, sizeof(recv_addr));
         return std::make_tuple(recv_addr, ClockType::now(),
                                DESTINATION_REACHED);
       }
-      if (last_ret == EINPROGRESS || last_ret == EALREADY) {
+      if (last_ret == EALREADY) {
+        auto cur_time = ClockType::now();
+        auto time_elapsed =
+            std::chrono::duration_cast<std::chrono::microseconds>(cur_time -
+                                                                  send_time_)
+                .count();
+        if (time_elapsed > time_limit_us_) {
+          return std::make_tuple(sockaddr{}, cur_time, TIMEOUT);
+        }
         last_ret =
             connect(send_fd_, reinterpret_cast<const struct sockaddr *>(&addr_),
                     sizeof(addr_));
