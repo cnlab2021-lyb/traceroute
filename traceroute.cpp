@@ -325,60 +325,63 @@ class TCPClient : public TraceRouteClient {
     std::array<uint8_t, kIpHeaderSize + ICMPPacket::kPacketSize + 64> buffer{};
     int last_ret{last_ret_};
     while (true) {
-      // TODO(wp): poll/select instead of busy wait.
-      if (last_ret == 0 || last_ret == ECONNREFUSED) {
-        struct sockaddr recv_addr {};
-        memcpy(&recv_addr, &addr_, sizeof(recv_addr));
-        return std::make_tuple(recv_addr, ClockType::now(),
-                               DESTINATION_REACHED);
+      fd_set read_fds{}, err_fds{};
+      FD_SET(send_fd_, &read_fds);
+      FD_SET(send_fd_, &err_fds);
+      auto cur_time = ClockType::now();
+      auto time_elapsed =
+          std::chrono::duration_cast<std::chrono::microseconds>(cur_time -
+                                                                send_time_)
+              .count();
+      if (time_elapsed > time_limit_us_) {
+        return std::make_tuple(sockaddr{}, ClockType::now(), TIMEOUT);
       }
-      if (last_ret == EALREADY) {
-        auto cur_time = ClockType::now();
-        auto time_elapsed =
-            std::chrono::duration_cast<std::chrono::microseconds>(cur_time -
-                                                                  send_time_)
-                .count();
-        if (time_elapsed > time_limit_us_) {
-          return std::make_tuple(sockaddr{}, cur_time, TIMEOUT);
-        }
+      timeval timeout_val{};
+      timeout_val.tv_sec = (time_limit_us_ - time_elapsed) / 1'000'000;
+      timeout_val.tv_usec = (time_limit_us_ - time_elapsed) % 1'000'000;
+      select(send_fd_ + 1, &read_fds, NULL, &err_fds, &timeout_val);
+      if (FD_ISSET(send_fd_, &read_fds) || FD_ISSET(send_fd_, &err_fds)) {
         last_ret =
             connect(send_fd_, reinterpret_cast<const struct sockaddr *>(&addr_),
                     sizeof(addr_));
-        if (last_ret < 0) {
-          last_ret = errno;
+        if (last_ret == 0 || last_ret == ECONNREFUSED) {
+          struct sockaddr recv_addr {};
+          memcpy(&recv_addr, &addr_, sizeof(recv_addr));
+          return std::make_tuple(recv_addr, ClockType::now(),
+                                DESTINATION_REACHED);
         }
-      } else {
-        ICMPPacket recv{};
-        struct sockaddr recv_addr {};
-        bool timeout = RecvICMPReply(buffer, recv, recv_addr);
-        auto recv_time = ClockType::now();
-        if (timeout) return std::make_tuple(sockaddr{}, recv_time, TIMEOUT);
+        if (last_ret != EALREADY) {
+          ICMPPacket recv{};
+          struct sockaddr recv_addr {};
+          bool timeout = RecvICMPReply(buffer, recv, recv_addr);
+          auto recv_time = ClockType::now();
+          if (timeout) return std::make_tuple(sockaddr{}, recv_time, TIMEOUT);
 
-        struct sockaddr_in send_addr {};
-        socklen_t len = sizeof(send_addr);
-        if (getsockname(send_fd_,
-                        reinterpret_cast<struct sockaddr *>(&send_addr),
-                        &len) < 0) {
-          PrintError("getsockname");
-        }
+          struct sockaddr_in send_addr {};
+          socklen_t len = sizeof(send_addr);
+          if (getsockname(send_fd_,
+                          reinterpret_cast<struct sockaddr *>(&send_addr),
+                          &len) < 0) {
+            PrintError("getsockname");
+          }
 
-        uint16_t port = ntohs(send_addr.sin_port);
-        TCPHeader header{};
-        memcpy(&header,
-               buffer.data() + kIpHeaderSize + ICMPPacket::kPacketSize +
-                   kIpHeaderSize,
-               sizeof(header));
-        if (ntohs(header.source_port) != port) continue;
-        if (recv.type == icmp::kTimeExceed) {
-          // TODO: Validate returned TCP packets.
-          return std::make_tuple(recv_addr, recv_time, TTL_EXPIRED);
-        }
-        if (recv.type == icmp::kDestinationUnreachable) {
-          constexpr std::array<ICMPStatus, 4> kUnreachableLookUpTable = {
-              NETWORK_UNREACHABLE, HOST_UNREACHABLE, PROTOCOL_UNREACHABLE,
-              DESTINATION_REACHED};
-          return std::make_tuple(recv_addr, recv_time,
-                                 kUnreachableLookUpTable.at(recv.type));
+          uint16_t port = ntohs(send_addr.sin_port);
+          TCPHeader header{};
+          memcpy(&header,
+                buffer.data() + kIpHeaderSize + ICMPPacket::kPacketSize +
+                    kIpHeaderSize,
+                sizeof(header));
+          if (ntohs(header.source_port) != port) continue;
+          if (recv.type == icmp::kTimeExceed) {
+            return std::make_tuple(recv_addr, recv_time, TTL_EXPIRED);
+          }
+          if (recv.type == icmp::kDestinationUnreachable) {
+            constexpr std::array<ICMPStatus, 4> kUnreachableLookUpTable = {
+                NETWORK_UNREACHABLE, HOST_UNREACHABLE, PROTOCOL_UNREACHABLE,
+                DESTINATION_REACHED};
+            return std::make_tuple(recv_addr, recv_time,
+                                  kUnreachableLookUpTable.at(recv.type));
+          }
         }
       }
     }
