@@ -309,8 +309,8 @@ class TCPClient : public TraceRouteClient {
                 sizeof(addr_));
     send_time_ = ClockType::now();
     if (last_ret_ != 0) {
-      if (errno == EHOSTUNREACH) {
-        last_ret_ = EHOSTUNREACH;
+      if (errno == EHOSTUNREACH || errno == ECONNREFUSED) {
+        last_ret_ = errno;
       } else if (errno == EINPROGRESS) {
         last_ret_ = EALREADY;
       } else {
@@ -324,31 +324,49 @@ class TCPClient : public TraceRouteClient {
     assert(last_ret_ != INT_MIN);
     std::array<uint8_t, kIpHeaderSize + ICMPPacket::kPacketSize + 64> buffer{};
     int last_ret{last_ret_};
+    if (last_ret != EALREADY) {
+      if (last_ret == EHOSTUNREACH) {
+        return std::make_tuple(sockaddr{}, ClockType::now(), TIMEOUT);
+      }
+      struct sockaddr recv_addr {};
+      memcpy(&recv_addr, &addr_, sizeof(recv_addr));
+      return std::make_tuple(recv_addr, ClockType::now(), DESTINATION_REACHED);
+    }
     while (true) {
-      fd_set read_fds{}, err_fds{};
+      fd_set read_fds{}, write_fds{}, err_fds{};
+      FD_ZERO(&read_fds);
+      FD_ZERO(&write_fds);
+      FD_ZERO(&err_fds);
       FD_SET(send_fd_, &read_fds);
+      FD_SET(send_fd_, &write_fds);
       FD_SET(send_fd_, &err_fds);
       auto cur_time = ClockType::now();
-      auto time_elapsed =
-          std::chrono::duration_cast<std::chrono::microseconds>(cur_time -
-                                                                send_time_)
-              .count();
+      auto time_elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+                              cur_time - send_time_)
+                              .count();
       if (time_elapsed > time_limit_us_) {
         return std::make_tuple(sockaddr{}, ClockType::now(), TIMEOUT);
       }
       timeval timeout_val{};
       timeout_val.tv_sec = (time_limit_us_ - time_elapsed) / 1'000'000;
       timeout_val.tv_usec = (time_limit_us_ - time_elapsed) % 1'000'000;
-      select(send_fd_ + 1, &read_fds, NULL, &err_fds, &timeout_val);
-      if (FD_ISSET(send_fd_, &read_fds) || FD_ISSET(send_fd_, &err_fds)) {
+      if (select(send_fd_ + 1, &read_fds, &write_fds, &err_fds, &timeout_val) <
+          0) {
+        PrintError("select");
+      }
+      if (FD_ISSET(send_fd_, &read_fds) || FD_ISSET(send_fd_, &write_fds) ||
+          FD_ISSET(send_fd_, &err_fds)) {
         last_ret =
             connect(send_fd_, reinterpret_cast<const struct sockaddr *>(&addr_),
                     sizeof(addr_));
+        if (last_ret != 0) {
+          last_ret = errno;
+        }
         if (last_ret == 0 || last_ret == ECONNREFUSED) {
           struct sockaddr recv_addr {};
           memcpy(&recv_addr, &addr_, sizeof(recv_addr));
           return std::make_tuple(recv_addr, ClockType::now(),
-                                DESTINATION_REACHED);
+                                 DESTINATION_REACHED);
         }
         if (last_ret != EALREADY) {
           ICMPPacket recv{};
@@ -368,9 +386,9 @@ class TCPClient : public TraceRouteClient {
           uint16_t port = ntohs(send_addr.sin_port);
           TCPHeader header{};
           memcpy(&header,
-                buffer.data() + kIpHeaderSize + ICMPPacket::kPacketSize +
-                    kIpHeaderSize,
-                sizeof(header));
+                 buffer.data() + kIpHeaderSize + ICMPPacket::kPacketSize +
+                     kIpHeaderSize,
+                 sizeof(header));
           if (ntohs(header.source_port) != port) continue;
           if (recv.type == icmp::kTimeExceed) {
             return std::make_tuple(recv_addr, recv_time, TTL_EXPIRED);
@@ -380,8 +398,10 @@ class TCPClient : public TraceRouteClient {
                 NETWORK_UNREACHABLE, HOST_UNREACHABLE, PROTOCOL_UNREACHABLE,
                 DESTINATION_REACHED};
             return std::make_tuple(recv_addr, recv_time,
-                                  kUnreachableLookUpTable.at(recv.type));
+                                   kUnreachableLookUpTable.at(recv.type));
           }
+        } else {
+          assert(false && "Unexpected last_ret.");
         }
       }
     }
