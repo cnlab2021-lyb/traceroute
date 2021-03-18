@@ -23,6 +23,7 @@ constexpr int kIpHeaderSize = 20;
 constexpr int kIcmpIdentifier = 0x7122, kIcmpSeqNum = 0x1234;
 constexpr uint16_t kInitialPort = 33435;
 
+// Perform DNS lookup
 in_addr LookUp(const char *domain) {
   hostent *host = gethostbyname(domain);
   if (!host || !host->h_addr_list) {
@@ -489,17 +490,16 @@ class UDPClient : public TraceRouteClient {
       auto recv_time = ClockType::now();
       if (timeout) return std::make_tuple(sockaddr{}, recv_time, TIMEOUT);
 
+      UDPHeader header{};
+      memcpy(&header,
+             buffer.data() + kIpHeaderSize + ICMPPacket::kPacketSize +
+                 kIpHeaderSize,
+             sizeof(header));
+      // Verify the returned UDP header by its destination port.
+      if (ntohs(header.destination_port) != port_ - 1) continue;
       if (recv.type == icmp::kTimeExceed) {
-        UDPHeader header{};
-        memcpy(&header,
-               buffer.data() + kIpHeaderSize + ICMPPacket::kPacketSize +
-                   kIpHeaderSize,
-               sizeof(header));
-        if (ntohs(header.destination_port) == port_ - 1) {
-          assert(recv.code == icmp::kTTLExpired);
-          // Verify the returned UDP header by its destination port.
-          return std::make_tuple(recv_addr, recv_time, TTL_EXPIRED);
-        }
+        assert(recv.code == icmp::kTTLExpired);
+        return std::make_tuple(recv_addr, recv_time, TTL_EXPIRED);
       }
       if (recv.type == icmp::kDestinationUnreachable) {
         constexpr std::array<ICMPStatus, 4> kUnreachableLookUpTable = {
