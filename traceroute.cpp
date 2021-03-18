@@ -13,7 +13,6 @@
 #include <iomanip>
 #include <iostream>
 #include <memory>
-#include <random>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -23,7 +22,6 @@ namespace {
 constexpr int kIpHeaderSize = 20;
 constexpr int kIcmpIdentifier = 0x7122, kIcmpSeqNum = 0x1234;
 constexpr uint16_t kInitialPort = 33435;
-constexpr double kInfinity = 1E9;
 
 in_addr LookUp(const char *domain) {
   hostent *host = gethostbyname(domain);
@@ -53,16 +51,14 @@ struct Config {
   int nqueries = 3;
   int first_ttl = 1;
   int max_ttl = 30;
-  double max_wait_time = 5.0;
-  int here_wait_time_multiplier = 3;
-  int near_wait_time_multiplier = 10;
+  double wait_time = 5.0;
   char *hostname;
 };
 
 [[noreturn]] void PrintUsage() {
   std::cerr << "Usage:\n";
   std::cerr << "  traceroute [ -IT ] [ -f first_ttl ] [ -q nqueries ] [ -m "
-               "max_ttl ] [ -w MAX,HERE,NEAR ] host\n";
+               "max_ttl ] [ -w waittime ] host\n";
   exit(1);
 }
 
@@ -84,6 +80,16 @@ Config ParseArg(int argc, char *argv[]) {
     }
   };
 
+  // NOLINTNEXTLINE
+  auto ParseFloat = [&]() {
+    if (optind == argc) PrintUsage();
+    try {
+      return std::stof(argv[optind++]);
+    } catch (...) {
+      PrintUsage();
+    }
+  };
+
   for (int opt = getopt(argc, argv, "fmqwIT"); opt != -1;
        opt = getopt(argc, argv, "fmqwIT")) {
     if (opt == 'I') config.mode = ICMP;
@@ -92,14 +98,7 @@ Config ParseArg(int argc, char *argv[]) {
     if (opt == 'f') config.first_ttl = ParseInt();
     if (opt == 'm') config.max_ttl = ParseInt();
     if (opt == 'q') config.nqueries = ParseInt();
-
-    if (opt == 'w') {
-      if (optind == argc) PrintUsage();
-      // XXX(waynetu): This is so ugly.
-      sscanf(argv[optind++], "%lf,%d,%d", &config.max_wait_time,
-             &config.here_wait_time_multiplier,
-             &config.near_wait_time_multiplier);
-    }
+    if (opt == 'w') config.wait_time = ParseFloat();
   }
 
   if (optind != argc - 1) PrintUsage();
@@ -178,9 +177,7 @@ struct UDPHeader {
   uint16_t checksum;
 };
 
-struct UDPPacket {
-  uint32_t data;
-};
+struct UDPPacket {};
 
 using Packet = std::variant<ICMPPacket, TCPPacket, UDPPacket>;
 using ClockType = std::chrono::steady_clock;
@@ -282,12 +279,28 @@ class TCPClient : public TraceRouteClient {
     send_fd_ = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
     struct sockaddr bind_addr {};
     bind_addr.sa_family = AF_INET;
-    if (bind(send_fd_, &bind_addr, sizeof(bind_addr)) < 0)
-      PrintError("bind");
+    if (bind(send_fd_, &bind_addr, sizeof(bind_addr)) < 0) PrintError("bind");
     if (setsockopt(send_fd_, IPPROTO_IP, IP_TTL,
                    reinterpret_cast<const void *>(&ttl), sizeof(ttl)) < 0)
       PrintError("setsockopt(ttl)");
-    struct timeval tv{};
+#ifndef __APPLE__
+    int mtu_discover = IP_PMTUDISC_DONT;
+    if (setsockopt(send_fd_, IPPROTO_IP, IP_MTU_DISCOVER,
+                   reinterpret_cast<const void *>(&mtu_discover),
+                   sizeof(mtu_discover)) < 0)
+      PrintError("setsockopt(mtu)");
+    int recvttl = 1;
+    if (setsockopt(send_fd_, IPPROTO_IP, IP_RECVTTL,
+                   reinterpret_cast<const void *>(&recvttl),
+                   sizeof(recvttl)) < 0)
+      PrintError("setsockopt(recvttl)");
+    int so_timestamp = 1;
+    if (setsockopt(send_fd_, SOL_SOCKET, SO_TIMESTAMP_OLD,
+                   reinterpret_cast<const void *>(&so_timestamp),
+                   sizeof(so_timestamp)) < 0)
+      PrintError("setsockopt(recvttl)");
+#endif
+    struct timeval tv {};
     tv.tv_sec = static_cast<int>(time_limit);
     tv.tv_usec = static_cast<int>((time_limit - static_cast<int>(time_limit)) *
                                   1'000'000);
@@ -396,7 +409,6 @@ class ICMPClient : public TraceRouteClient {
       auto recv_time = ClockType::now();
       if (timeout) return std::make_tuple(sockaddr{}, recv_time, TIMEOUT);
 
-      // TODO(wp): Handle timeouts
       if (recv.identifier == kIcmpIdentifier &&
           recv.sequence_number == kIcmpSeqNum) {
         if (recv.type == icmp::kEchoReply) {
@@ -404,9 +416,6 @@ class ICMPClient : public TraceRouteClient {
         }
       }
       if (recv.type == icmp::kTimeExceed) {
-        if (recv.code == icmp::kFragmentReassemblyTimeExceeded) {
-          // TODO(waynetu): Unexpected case
-        }
         ICMPPacket orig{};
         memcpy(&orig,
                buffer.data() + kIpHeaderSize + ICMPPacket::kPacketSize +
@@ -416,6 +425,7 @@ class ICMPClient : public TraceRouteClient {
         orig.sequence_number = ntohs(orig.sequence_number);
         if (orig.identifier == kIcmpIdentifier &&
             orig.sequence_number == kIcmpSeqNum) {
+          assert(recv.code == icmp::kTTLExpired);
           return std::make_tuple(recv_addr, recv_time, TTL_EXPIRED);
         }
       }
@@ -471,6 +481,7 @@ class UDPClient : public TraceRouteClient {
                    kIpHeaderSize,
                sizeof(header));
         if (ntohs(header.destination_port) == port_ - 1) {
+          assert(recv.code == icmp::kTTLExpired);
           // Verify the returned UDP header by its destination port.
           return std::make_tuple(recv_addr, recv_time, TTL_EXPIRED);
         }
@@ -490,14 +501,9 @@ Packet BuildPacket(Mode mode) {
   switch (mode) {
     case TCP:
       return TCPPacket{};
-    case UDP: {
-      std::mt19937 rng(
-          std::chrono::high_resolution_clock::now().time_since_epoch().count());
-      return UDPPacket{static_cast<uint32_t>(rng())};
-    }
+    case UDP:
+      return UDPPacket{};
     case ICMP:
-      // TODO(waynetu): properly set up identifer and sequence number for ICMP
-      // packets.
       return ICMPPacket(kIcmpIdentifier, kIcmpSeqNum);
   }
   __builtin_unreachable();
@@ -531,8 +537,8 @@ class TraceRouteLogger {
   }
   ~TraceRouteLogger() { std::cout << "\n"; }
 
-  double Print(struct sockaddr ip, const TimePoint &send_time,
-               const TimePoint &recv_time, ICMPStatus status) {
+  void Print(struct sockaddr ip, const TimePoint &send_time,
+             const TimePoint &recv_time, ICMPStatus status) {
     // First reply
     if (ip != previous_ip_ && status != TIMEOUT) {
       if (!first_record_) std::cout << "\n   ";
@@ -542,7 +548,6 @@ class TraceRouteLogger {
                 << inet_ntoa(reinterpret_cast<sockaddr_in *>(&ip)->sin_addr)
                 << ")";
     }
-    double result = kInfinity;
     if (status == TIMEOUT) {
       std::cout << " *";
     } else if (status == HOST_UNREACHABLE) {
@@ -558,11 +563,9 @@ class TraceRouteLogger {
       std::cout << std::fixed << std::setprecision(3) << "  "
                 << static_cast<double>(time_elapsed) / 1'000 << " ms";
       previous_ip_ = ip;
-      result = static_cast<double>(time_elapsed) / 1'000'000;
     }
     first_record_ = false;
     std::cout << std::flush;
-    return result;
   }
 };
 
@@ -578,27 +581,19 @@ int main(int argc, char *argv[]) {
             << client->GetAddress() << "), " << config.max_ttl << " hops max"
             << std::endl;
 
-  double prev_hop = kInfinity;
   for (int hop = config.first_ttl; hop <= config.max_ttl; ++hop) {
     bool is_exceed = true;
     TraceRouteLogger logger(hop);
     // XXX(waynetu): (Improvement) Send all requests before receiving replies.
-    double current_hop = kInfinity;
     for (int query = 0; query < config.nqueries; ++query) {
-      double time_limit =
-          std::min(config.max_wait_time,
-                   std::min(config.near_wait_time_multiplier * prev_hop,
-                            config.here_wait_time_multiplier * current_hop));
-      client->InitSocket(hop, time_limit);
+      client->InitSocket(hop, config.wait_time);
       auto send_time = ClockType::now();
       auto packet = BuildPacket(config.mode);
       client->SendRequest(packet);
       auto [source_ip, recv_time, status] = client->RecvReply();
       is_exceed &= (status != DESTINATION_REACHED);
-      current_hop = std::min(
-          current_hop, logger.Print(source_ip, send_time, recv_time, status));
+      logger.Print(source_ip, send_time, recv_time, status);
     }
-    prev_hop = current_hop;
 
     // Destination reached
     if (!is_exceed) break;
